@@ -2256,6 +2256,39 @@ std::pair<std::string, std::string> GenerateRoleplayName(
         "Fedoseev", "Fetisov", "Kharitonov", "Kholodov", "Shcherbakov"
     };
 
+    // Remove accidental duplicate entries from source lists before constructing
+    // combinations. This ensures each generated first/surname value is weighted once.
+    auto normalizeName = [](std::string value)
+    {
+        std::transform(
+            value.begin(),
+            value.end(),
+            value.begin(),
+            [](unsigned char ch)
+            {
+                return static_cast<char>(std::tolower(ch));
+            }
+        );
+        return value;
+    };
+
+    std::vector<std::string> uniqueFirstNames;
+    std::vector<std::string> uniqueLastNames;
+    std::unordered_set<std::string> seenFirstNames;
+    std::unordered_set<std::string> seenLastNames;
+
+    for (const std::string& name : firstNames)
+    {
+        if (seenFirstNames.insert(normalizeName(name)).second)
+            uniqueFirstNames.push_back(name);
+    }
+
+    for (const std::string& name : lastNames)
+    {
+        if (seenLastNames.insert(normalizeName(name)).second)
+            uniqueLastNames.push_back(name);
+    }
+
     // Protect the history read and candidate reservation from any parallel callers.
     std::lock_guard<std::mutex> historyLock(g_NamesFileMutex);
 
@@ -2297,20 +2330,20 @@ std::pair<std::string, std::string> GenerateRoleplayName(
     std::vector<NameIndexes> uniqueFullNames;
 
     for (size_t firstIndex = 0;
-        firstIndex < firstNames.size();
+        firstIndex < uniqueFirstNames.size();
         ++firstIndex)
     {
-        std::string firstKey = firstNames[firstIndex];
+        std::string firstKey = uniqueFirstNames[firstIndex];
         std::transform(
             firstKey.begin(), firstKey.end(), firstKey.begin(),
             [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); }
         );
 
         for (size_t lastIndex = 0;
-            lastIndex < lastNames.size();
+            lastIndex < uniqueLastNames.size();
             ++lastIndex)
         {
-            std::string lastKey = lastNames[lastIndex];
+            std::string lastKey = uniqueLastNames[lastIndex];
             std::transform(
                 lastKey.begin(), lastKey.end(), lastKey.begin(),
                 [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); }
@@ -2346,8 +2379,8 @@ std::pair<std::string, std::string> GenerateRoleplayName(
 
     return
     {
-        firstNames[selected.first],
-        lastNames[selected.second]
+        uniqueFirstNames[selected.first],
+        uniqueLastNames[selected.second]
     };
 }
 
