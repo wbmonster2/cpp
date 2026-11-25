@@ -1253,6 +1253,8 @@ bool ClearADBTextField(
                 std::to_string(GetLastError());
             return false;
         }
+
+        Sleep(3);
     }
 
     diagnostic =
@@ -2299,9 +2301,8 @@ bool WaitForPhotonAfterLogin(
     return false;
 }
 
-// Ждёт появления конкретного шаблона.
-// Нужны два последовательных успешных совпадения,
-// чтобы не реагировать на случайный кадр.
+// Ждёт одно уверенное совпадение конкретного шаблона,
+// чтобы сократить задержку на каждом экране.
 bool WaitForStage(
     const std::string& deviceId,
     const std::string& templateName,
