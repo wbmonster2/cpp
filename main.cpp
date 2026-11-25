@@ -2232,7 +2232,7 @@ AutomationResult RunPhotonAutomation(
     {
         log
             << "Login attempt "
-            << attempt << "/2 using touchscreen input\n";
+            << attempt << "/2 using REAL WINDOWS MOUSE input\n";
 
         std::string tapDiagnostic;
 
