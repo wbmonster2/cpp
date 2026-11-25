@@ -3116,7 +3116,7 @@ AutomationResult RunPhotonAutomation(
         "enter_lastname",
         lastNameCenter,
         surnameDiagnostic,
-        30000))
+        5000))
     {
         log << "LAST NAME FIELD NOT FOUND: " << surnameDiagnostic << "\n";
         return result;
