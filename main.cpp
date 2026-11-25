@@ -468,25 +468,55 @@ bool TapADB(
         return false;
     }
 
-    std::wstring arguments =
-        L"-s " + DeviceArgument(deviceId) +
-        L" shell input tap " +
-        std::to_wstring(x) + L" " +
-        std::to_wstring(y);
+    const std::wstring serial = DeviceArgument(deviceId);
+    const std::wstring sx = std::to_wstring(x);
+    const std::wstring sy = std::to_wstring(y);
 
-    std::string output = ExecuteADB(arguments, 8000);
+    // Explicit touchscreen source is more reliable for LDPlayer's
+    // WebView/game UI than the generic input tap source.
+    std::wstring command =
+        L"-s " + serial +
+        L" shell input touchscreen tap " + sx + L" " + sy;
+
+    std::string output = ExecuteADB(command, 8000);
+
+    if (!IsADBError(output))
+    {
+        diagnostic = "Touchscreen tap sent at (" +
+            std::to_string(x) + ", " + std::to_string(y) + ").";
+        return true;
+    }
+
+    // Fallback gesture: DOWN/MOVE/UP at the same coordinates.
+    command =
+        L"-s " + serial +
+        L" shell input touchscreen swipe " +
+        sx + L" " + sy + L" " + sx + L" " + sy + L" 120";
+
+    output = ExecuteADB(command, 8000);
+
+    if (!IsADBError(output))
+    {
+        diagnostic = "Touchscreen swipe-tap sent at (" +
+            std::to_string(x) + ", " + std::to_string(y) + ").";
+        return true;
+    }
+
+    // Last fallback for LDPlayer images exposing a mouse input source.
+    command =
+        L"-s " + serial +
+        L" shell input mouse tap " + sx + L" " + sy;
+
+    output = ExecuteADB(command, 8000);
 
     if (IsADBError(output))
     {
-        diagnostic = output;
+        diagnostic = "Touch input failed: " + output;
         return false;
     }
 
-    diagnostic =
-        "Tap sent at (" +
-        std::to_string(x) + ", " +
-        std::to_string(y) + ").";
-
+    diagnostic = "Mouse tap sent at (" +
+        std::to_string(x) + ", " + std::to_string(y) + ").";
     return true;
 }
 
@@ -569,20 +599,37 @@ bool InputADBText(
         return false;
     }
 
-    std::wstring arguments =
-        L"-s " + DeviceArgument(deviceId) +
-        L" shell input text " +
-        Utf8ToWide(value);
+    const std::wstring serial = DeviceArgument(deviceId);
+    const std::wstring text = Utf8ToWide(value);
 
-    std::string output = ExecuteADB(arguments, 10000);
+    // Quote text inside the Android shell, avoiding Windows/Android
+    // argument parsing differences observed on some LDPlayer versions.
+    std::wstring command =
+        L"-s " + serial +
+        L" shell \"input text '" + text + L"'\"";
+
+    std::string output = ExecuteADB(command, 15000);
+
+    if (!IsADBError(output))
+    {
+        diagnostic = "Quoted Android input-text command sent.";
+        return true;
+    }
+
+    // Stock Android-compatible fallback.
+    command =
+        L"-s " + serial +
+        L" shell input text " + text;
+
+    output = ExecuteADB(command, 15000);
 
     if (IsADBError(output))
     {
-        diagnostic = output;
+        diagnostic = "Both Android text-input methods failed: " + output;
         return false;
     }
 
-    diagnostic = "Text input command sent.";
+    diagnostic = "Direct Android input-text fallback sent.";
     return true;
 }
 
@@ -1648,7 +1695,7 @@ AutomationResult RunPhotonAutomation(
     {
         log
             << "Login attempt "
-            << attempt << "/2\n";
+            << attempt << "/2 using touchscreen input\n";
 
         std::string tapDiagnostic;
 
@@ -1744,7 +1791,8 @@ AutomationResult RunPhotonAutomation(
     log << "\nGENERATED FIRST NAME: "
         << firstName << "\n";
 
-    // Tap again after clearing to ensure the field has focus.
+    // Re-focus the first-name field and allow Android IME/WebView
+    // to become active before injecting text.
     if (!TapADB(device.id, 185, 241, nameDiagnostic))
     {
         log << "FIRST NAME FIELD TAP ERROR: "
@@ -1752,22 +1800,19 @@ AutomationResult RunPhotonAutomation(
         return result;
     }
 
-    Sleep(150);
+    Sleep(450);
 
     std::string inputDiagnostic;
 
-    if (!InputADBText(
-        device.id,
-        firstName,
-        inputDiagnostic))
+    if (!InputADBText(device.id, firstName, inputDiagnostic))
     {
         log << "FIRST NAME INPUT ERROR: "
             << inputDiagnostic << "\n";
-
         return result;
     }
 
-    log << "First name input command sent.\n";
+    log << "FIRST NAME INPUT: " << inputDiagnostic << "\n";
+    Sleep(350);
 
     // --------------------------------------------------------
     // STEP 4: CLEAR SURNAME AND IMMEDIATELY INPUT IT
@@ -1795,7 +1840,7 @@ AutomationResult RunPhotonAutomation(
     log << "CREDENTIALS: login - \"" << firstName << "_"
         << lastName << "\", password - \"" << password << "\"\n";
 
-    // Tap again after clearing to ensure the surname field has focus.
+    // Re-focus surname and give Android IME/WebView time to accept input.
     if (!TapADB(device.id, 185, 297, surnameDiagnostic))
     {
         log << "LAST NAME FIELD TAP ERROR: "
@@ -1803,20 +1848,17 @@ AutomationResult RunPhotonAutomation(
         return result;
     }
 
-    Sleep(150);
+    Sleep(450);
 
-    if (!InputADBText(
-        device.id,
-        lastName,
-        inputDiagnostic))
+    if (!InputADBText(device.id, lastName, inputDiagnostic))
     {
         log << "LAST NAME INPUT ERROR: "
             << inputDiagnostic << "\n";
-
         return result;
     }
 
-    log << "Last name input command sent.\n";
+    log << "LAST NAME INPUT: " << inputDiagnostic << "\n";
+    Sleep(350);
 
     // --------------------------------------------------------
     // STEP 5: CONFIRM INPUT COMMANDS
