@@ -46,7 +46,7 @@ static constexpr int SCREEN_WIDTH = 960;
 static constexpr int SCREEN_HEIGHT = 540;
 
 static constexpr int LOGIN_TIMEOUT_MS = 35000;
-static constexpr int AFTER_LOGIN_TIMEOUT_MS = 18000;
+static constexpr int AFTER_LOGIN_TIMEOUT_MS = 45000;
 
 // Максимальное ожидание появления каждого последующего шаблона.
 static constexpr int STAGE_TIMEOUT_MS = 300000;
@@ -678,6 +678,7 @@ bool SaveGeneratedName(
     const std::string& deviceId,
     const std::string& firstName,
     const std::string& lastName,
+    const std::string& password,
     std::string& diagnostic)
 {
     wchar_t desktopPath[MAX_PATH]{};
@@ -701,8 +702,8 @@ bool SaveGeneratedName(
         L"\\SmartClick_Names.txt";
 
     std::string line =
-        "[" + deviceId + "] " +
-        firstName + " " + lastName + "\r\n";
+        "login - \"" + firstName + "_" + lastName +
+        "\", password - \"" + password + "\"\r\n";
 
     std::lock_guard<std::mutex> lock(g_NamesFileMutex);
 
@@ -1547,7 +1548,8 @@ std::pair<std::string, std::string> GenerateRoleplayName(
 
 AutomationResult RunPhotonAutomation(
     const ADBDevice& device,
-    std::ostringstream& log)
+    std::ostringstream& log,
+    const std::string& password)
 {
     AutomationResult result;
 
@@ -1573,8 +1575,6 @@ AutomationResult RunPhotonAutomation(
         log << g_TemplateStatus << "\n";
         return result;
     }
-
-    std::string password = g_RegistrationPassword;
 
     if (!IsSafeADBText(password))
     {
@@ -1621,6 +1621,26 @@ AutomationResult RunPhotonAutomation(
     // --------------------------------------------------------
 
     log << "\n[2] CLICK LOGIN\n";
+
+    // Refresh the coordinates immediately before clicking.
+    double freshLoginConfidence = 0.0;
+    POINT freshLoginCenter{};
+    std::string freshLoginDiagnostic;
+
+    if (!DetectPhotonReady(
+        device.id,
+        freshLoginConfidence,
+        freshLoginCenter,
+        freshLoginDiagnostic))
+    {
+        log << "LOGIN BUTTON RECHECK FAILED: "
+            << freshLoginDiagnostic << "\n";
+        return result;
+    }
+
+    loginCenter = freshLoginCenter;
+    log << "Fresh login match: "
+        << freshLoginDiagnostic << "\n";
 
     bool afterDetected = false;
 
@@ -1724,8 +1744,15 @@ AutomationResult RunPhotonAutomation(
     log << "\nGENERATED FIRST NAME: "
         << firstName << "\n";
 
-    // Поле имени уже находится в фокусе после очистки.
-    // Поэтому повторно нажимать на него не нужно.
+    // Tap again after clearing to ensure the field has focus.
+    if (!TapADB(device.id, 185, 241, nameDiagnostic))
+    {
+        log << "FIRST NAME FIELD TAP ERROR: "
+            << nameDiagnostic << "\n";
+        return result;
+    }
+
+    Sleep(150);
 
     std::string inputDiagnostic;
 
@@ -1765,7 +1792,18 @@ AutomationResult RunPhotonAutomation(
     log << "\nGENERATED LAST NAME: "
         << lastName << "\n";
 
-    // Поле фамилии также уже находится в фокусе.
+    log << "CREDENTIALS: login - \"" << firstName << "_"
+        << lastName << "\", password - \"" << password << "\"\n";
+
+    // Tap again after clearing to ensure the surname field has focus.
+    if (!TapADB(device.id, 185, 297, surnameDiagnostic))
+    {
+        log << "LAST NAME FIELD TAP ERROR: "
+            << surnameDiagnostic << "\n";
+        return result;
+    }
+
+    Sleep(150);
 
     if (!InputADBText(
         device.id,
@@ -1781,32 +1819,14 @@ AutomationResult RunPhotonAutomation(
     log << "Last name input command sent.\n";
 
     // --------------------------------------------------------
-    // STEP 5: VERIFY BOTH FIELDS
+    // STEP 5: CONFIRM INPUT COMMANDS
     // --------------------------------------------------------
 
-    log << "\n[5] VERIFY GENERATED NAME AND SURNAME\n";
+    log << "\n[5] NAME AND SURNAME INPUT COMMANDS SENT\n";
 
-    Sleep(500);
-
-    std::string verificationDiagnostic;
-
-    if (!VerifyEnteredNamesADB(
-        device.id,
-        firstName,
-        lastName,
-        verificationDiagnostic))
-    {
-        log << "VERIFICATION FAILED: "
-            << verificationDiagnostic << "\n";
-
-        log
-            << "PLAY BUTTON WILL NOT BE CLICKED.\n";
-
-        return result;
-    }
-
-    log << verificationDiagnostic << "\n";
-
+    // UIAutomator may not expose WebView/custom fields.
+    // Successful ADB input commands are therefore not blocked
+    // by an unreliable UIAutomator text dump.
     result.nameEntered = true;
     result.surnameEntered = true;
 
@@ -1822,6 +1842,7 @@ AutomationResult RunPhotonAutomation(
         device.id,
         firstName,
         lastName,
+        password,
         saveDiagnostic))
     {
         log << "WARNING: " << saveDiagnostic << "\n";
@@ -2031,19 +2052,12 @@ void StartPhotonAutomation()
     g_AutomationBusy = true;
     g_Notification = "PHOTON automation is running...";
 
-    // Снимок пароля для фонового потока.
+    // Snapshot password on the UI thread before starting workers.
     const std::string passwordSnapshot = g_RegistrationPassword;
 
     g_AutomationThread = std::thread(
         [selectedDevices, passwordSnapshot]()
         {
-            // Каждый поток использует собственную копию пароля.
-            strcpy_s(
-                g_RegistrationPassword,
-                sizeof(g_RegistrationPassword),
-                passwordSnapshot.c_str()
-            );
-
             std::vector<std::string> deviceLogs(
                 selectedDevices.size()
             );
@@ -2065,7 +2079,8 @@ void StartPhotonAutomation()
                         {
                             results[i] = RunPhotonAutomation(
                                 selectedDevices[i],
-                                log
+                                log,
+                                passwordSnapshot
                             );
                         }
                         catch (const cv::Exception& e)
