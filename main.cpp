@@ -4442,6 +4442,26 @@ void DrawAutoLaunch()
         detectionLogCopy = g_PhotonDetectionLog;
     }
 
+    if (ImGui::Button("COPY LOG", ImVec2(130, 30)))
+    {
+        std::string completeLog = detectionLogCopy;
+
+        if (!g_PhotonLaunchLog.empty())
+        {
+            if (!completeLog.empty())
+                completeLog += "\n\n";
+
+            completeLog += "========== PHOTON LAUNCH LOG ==========\n";
+            completeLog += g_PhotonLaunchLog;
+        }
+
+        if (completeLog.empty())
+            completeLog = "SmartClick log is empty.";
+
+        ImGui::SetClipboardText(completeLog.c_str());
+        g_Notification = "Log copied to clipboard.";
+    }
+
     ImGui::BeginChild(
         "PhotonDetectionLog",
         ImVec2(0, 260),
