@@ -114,6 +114,7 @@ struct ADBDevice
     std::string status;
     std::string model;
     bool selected = false;
+    HWND automationWindow = nullptr;
 };
 
 struct EmulatorWindow
@@ -133,6 +134,11 @@ struct AutomationResult
 
 static std::vector<ADBDevice> g_Devices;
 static std::vector<EmulatorWindow> g_EmulatorWindows;
+
+// Real Win32 input is global to the desktop, so automation is serialized.
+// Each ADB device is explicitly mapped to its visible LDPlayer top-level HWND.
+static std::mutex g_DeviceWindowMapMutex;
+static std::map<std::string, HWND> g_DeviceWindowMap;
 
 static const char* g_PageNames[] =
 {
@@ -459,6 +465,225 @@ std::wstring DeviceArgument(const std::string& deviceId)
 // Implemented below with Android text-input helpers.
 bool IsAndroidInputError(const std::string& output);
 
+// ============================================================
+// REAL WINDOWS INPUT (VISIBLE MOUSE + KEYBOARD)
+// ============================================================
+
+HWND GetMappedEmulatorWindow(const std::string& deviceId)
+{
+    std::lock_guard<std::mutex> lock(g_DeviceWindowMapMutex);
+    auto it = g_DeviceWindowMap.find(deviceId);
+
+    if (it == g_DeviceWindowMap.end())
+        return nullptr;
+
+    return it->second;
+}
+
+struct RenderChildSearch
+{
+    HWND bestWindow = nullptr;
+    double bestScore = -1.0;
+};
+
+BOOL CALLBACK FindRenderChildCallback(HWND hwnd, LPARAM parameter)
+{
+    auto* search = reinterpret_cast<RenderChildSearch*>(parameter);
+
+    if (!search || !IsWindowVisible(hwnd))
+        return TRUE;
+
+    RECT rc{};
+    if (!GetClientRect(hwnd, &rc))
+        return TRUE;
+
+    const int width = rc.right - rc.left;
+    const int height = rc.bottom - rc.top;
+
+    if (width < 320 || height < 180)
+        return TRUE;
+
+    const double ratio = static_cast<double>(width) /
+        static_cast<double>(height);
+
+    // The ADB screenshots are 16:9. Prefer the largest visible child
+    // whose client area resembles the actual game render surface.
+    if (ratio < 1.45 || ratio > 2.05)
+        return TRUE;
+
+    const double ratioError = std::abs(std::log(ratio / 1.7777777778));
+    const double area = static_cast<double>(width) * height;
+    const double score = area / (1.0 + ratioError * 5.0);
+
+    if (score > search->bestScore)
+    {
+        search->bestScore = score;
+        search->bestWindow = hwnd;
+    }
+
+    return TRUE;
+}
+
+HWND FindEmulatorRenderWindow(HWND topLevelWindow)
+{
+    if (!IsWindow(topLevelWindow))
+        return nullptr;
+
+    RenderChildSearch search;
+    EnumChildWindows(
+        topLevelWindow,
+        FindRenderChildCallback,
+        reinterpret_cast<LPARAM>(&search)
+    );
+
+    return search.bestWindow ? search.bestWindow : topLevelWindow;
+}
+
+bool ActivateEmulatorWindow(
+    const std::string& deviceId,
+    HWND& topLevelWindow,
+    HWND& renderWindow,
+    std::string& diagnostic)
+{
+    topLevelWindow = GetMappedEmulatorWindow(deviceId);
+
+    if (!topLevelWindow || !IsWindow(topLevelWindow))
+    {
+        diagnostic =
+            "No valid LDPlayer window is mapped to ADB device " +
+            deviceId +
+            ". Assign the matching window in Emulator Manager.";
+        return false;
+    }
+
+    renderWindow = FindEmulatorRenderWindow(topLevelWindow);
+
+    if (!renderWindow || !IsWindow(renderWindow))
+    {
+        diagnostic = "Could not find the LDPlayer render area.";
+        return false;
+    }
+
+    if (IsIconic(topLevelWindow))
+        ShowWindow(topLevelWindow, SW_RESTORE);
+    else
+        ShowWindow(topLevelWindow, SW_SHOW);
+
+    DWORD targetThreadId =
+        GetWindowThreadProcessId(topLevelWindow, nullptr);
+
+    DWORD currentThreadId = GetCurrentThreadId();
+    bool attached = false;
+
+    if (targetThreadId != 0 && targetThreadId != currentThreadId)
+        attached = AttachThreadInput(
+            currentThreadId,
+            targetThreadId,
+            TRUE
+        ) != FALSE;
+
+    BringWindowToTop(topLevelWindow);
+    SetForegroundWindow(topLevelWindow);
+    SetActiveWindow(topLevelWindow);
+    SetFocus(renderWindow);
+
+    Sleep(120);
+
+    HWND foreground = GetForegroundWindow();
+    HWND foregroundRoot = foreground
+        ? GetAncestor(foreground, GA_ROOT)
+        : nullptr;
+
+    const bool isForeground =
+        foreground == topLevelWindow ||
+        foregroundRoot == topLevelWindow;
+
+    if (attached)
+        AttachThreadInput(currentThreadId, targetThreadId, FALSE);
+
+    if (!isForeground)
+    {
+        diagnostic =
+            "Windows did not grant foreground focus to LDPlayer. "
+            "Bring the emulator to the front and try again.";
+        return false;
+    }
+
+    diagnostic = "LDPlayer window focused for real desktop input.";
+    return true;
+}
+
+bool GetScreenPointForEmulator(
+    HWND renderWindow,
+    int x,
+    int y,
+    POINT& screenPoint,
+    std::string& diagnostic)
+{
+    RECT client{};
+    if (!GetClientRect(renderWindow, &client))
+    {
+        diagnostic = "GetClientRect failed for LDPlayer render area.";
+        return false;
+    }
+
+    const int width = client.right - client.left;
+    const int height = client.bottom - client.top;
+
+    if (width <= 0 || height <= 0)
+    {
+        diagnostic = "LDPlayer render area has invalid dimensions.";
+        return false;
+    }
+
+    POINT origin{ 0, 0 };
+    if (!ClientToScreen(renderWindow, &origin))
+    {
+        diagnostic = "ClientToScreen failed for LDPlayer render area.";
+        return false;
+    }
+
+    screenPoint.x = origin.x +
+        static_cast<LONG>(std::lround(
+            static_cast<double>(x) * width / SCREEN_WIDTH
+        ));
+
+    screenPoint.y = origin.y +
+        static_cast<LONG>(std::lround(
+            static_cast<double>(y) * height / SCREEN_HEIGHT
+        ));
+
+    return true;
+}
+
+bool SendVirtualKey(WORD virtualKey, std::string& diagnostic)
+{
+    INPUT events[2]{};
+
+    events[0].type = INPUT_KEYBOARD;
+    events[0].ki.wVk = virtualKey;
+
+    events[1].type = INPUT_KEYBOARD;
+    events[1].ki.wVk = virtualKey;
+    events[1].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    const UINT sent = SendInput(
+        2,
+        events,
+        sizeof(INPUT)
+    );
+
+    if (sent != 2)
+    {
+        diagnostic =
+            "SendInput keyboard failed. Win32 error: " +
+            std::to_string(GetLastError());
+        return false;
+    }
+
+    return true;
+}
+
 bool TapADB(
     const std::string& deviceId,
     int x,
@@ -472,60 +697,76 @@ bool TapADB(
         return false;
     }
 
-    const std::wstring serial = DeviceArgument(deviceId);
-    const std::wstring sx = std::to_wstring(x);
-    const std::wstring sy = std::to_wstring(y);
+    HWND topLevelWindow = nullptr;
+    HWND renderWindow = nullptr;
 
-    // Try the standard Android tap command first. Some LDPlayer builds
-    // accept input tap but silently ignore the explicit touchscreen source.
-    const std::vector<std::pair<std::wstring, std::string>> attempts =
+    if (!ActivateEmulatorWindow(
+        deviceId,
+        topLevelWindow,
+        renderWindow,
+        diagnostic))
     {
-        {
-            L"-s " + serial + L" shell input tap " + sx + L" " + sy,
-            "Android input tap"
-        },
-        {
-            L"-s " + serial + L" shell input touchscreen tap " + sx + L" " + sy,
-            "Android touchscreen tap"
-        },
-        {
-            L"-s " + serial + L" shell input touchscreen swipe " +
-                sx + L" " + sy + L" " + sx + L" " + sy + L" 120",
-            "Android touchscreen swipe-tap"
-        },
-        {
-            L"-s " + serial + L" shell input mouse tap " + sx + L" " + sy,
-            "Android mouse tap"
-        }
-    };
-
-    std::string errors;
-
-    for (const auto& attempt : attempts)
-    {
-        const std::string output = ExecuteADB(attempt.first, 8000);
-
-        if (!IsADBError(output) && !IsAndroidInputError(output))
-        {
-            diagnostic =
-                attempt.second + " sent at (" +
-                std::to_string(x) + ", " + std::to_string(y) + ").";
-
-            if (!output.empty())
-                diagnostic += " ADB: " + output;
-
-            return true;
-        }
-
-        if (!errors.empty())
-            errors += " | ";
-
-        errors += attempt.second + ": " +
-            (output.empty() ? std::string("ADB execution failed") : output);
+        return false;
     }
 
-    diagnostic = "All tap methods failed. " + errors;
-    return false;
+    POINT screenPoint{};
+    if (!GetScreenPointForEmulator(
+        renderWindow,
+        x,
+        y,
+        screenPoint,
+        diagnostic))
+    {
+        return false;
+    }
+
+    // This moves the real desktop cursor to the game control.
+    if (!SetCursorPos(screenPoint.x, screenPoint.y))
+    {
+        diagnostic =
+            "SetCursorPos failed. Win32 error: " +
+            std::to_string(GetLastError());
+        return false;
+    }
+
+    Sleep(90);
+
+    INPUT down{};
+    down.type = INPUT_MOUSE;
+    down.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+
+    INPUT up{};
+    up.type = INPUT_MOUSE;
+    up.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+
+    if (SendInput(1, &down, sizeof(INPUT)) != 1)
+    {
+        diagnostic =
+            "Mouse left-down failed. Win32 error: " +
+            std::to_string(GetLastError());
+        return false;
+    }
+
+    Sleep(45);
+
+    if (SendInput(1, &up, sizeof(INPUT)) != 1)
+    {
+        diagnostic =
+            "Mouse left-up failed. Win32 error: " +
+            std::to_string(GetLastError());
+        return false;
+    }
+
+    Sleep(100);
+
+    diagnostic =
+        "REAL WINDOWS MOUSE CLICK at game coordinates (" +
+        std::to_string(x) + ", " + std::to_string(y) +
+        "), desktop coordinates (" +
+        std::to_string(screenPoint.x) + ", " +
+        std::to_string(screenPoint.y) + ").";
+
+    return true;
 }
 
 bool SendBackspaceADB(
@@ -536,26 +777,36 @@ bool SendBackspaceADB(
     if (count < 1)
         count = 1;
 
-    std::wstring shellCommand = L"input keyevent 123; input keyevent";
+    HWND topLevelWindow = nullptr;
+    HWND renderWindow = nullptr;
 
-    for (int i = 0; i < count; ++i)
-        shellCommand += L" 67";
-
-    std::wstring arguments =
-        L"-s " + DeviceArgument(deviceId) +
-        L" shell \"" + shellCommand + L"\"";
-
-    std::string output = ExecuteADB(arguments, 10000);
-
-    if (IsADBError(output))
+    if (!ActivateEmulatorWindow(
+        deviceId,
+        topLevelWindow,
+        renderWindow,
+        diagnostic))
     {
-        diagnostic = output;
         return false;
     }
 
+    // Move caret to the end, then send exactly the requested Backspace count.
+    if (!SendVirtualKey(VK_END, diagnostic))
+        return false;
+
+    Sleep(80);
+
+    for (int i = 0; i < count; ++i)
+    {
+        if (!SendVirtualKey(VK_BACK, diagnostic))
+            return false;
+
+        Sleep(22);
+    }
+
     diagnostic =
+        "REAL WINDOWS KEYBOARD: End + " +
         std::to_string(count) +
-        " Backspace events sent.";
+        " Backspace key presses.";
 
     return true;
 }
@@ -639,69 +890,53 @@ bool InputADBText(
         return false;
     }
 
-    const std::wstring serial = DeviceArgument(deviceId);
-    const std::wstring text = Utf8ToWide(value);
+    HWND topLevelWindow = nullptr;
+    HWND renderWindow = nullptr;
 
-    // Send characters separately instead of one large burst.
-    // Some embedded game/WebView fields drop fast consecutive key events.
-    std::wstring shellCommand;
-
-    for (wchar_t ch : text)
+    if (!ActivateEmulatorWindow(
+        deviceId,
+        topLevelWindow,
+        renderWindow,
+        diagnostic))
     {
-        if (!shellCommand.empty())
-            shellCommand += L"; sleep 0.08; ";
-
-        shellCommand += L"input keyboard text ";
-        shellCommand += ch;
-    }
-
-    std::wstring arguments =
-        L"-s " + serial +
-        L" shell \"" + shellCommand + L"\"";
-
-    std::string output = ExecuteADB(
-        arguments,
-        static_cast<DWORD>(std::max<size_t>(15000, text.size() * 1200))
-    );
-
-    if (!IsADBError(output) && !IsAndroidInputError(output))
-    {
-        diagnostic =
-            "Characters sent one by one with 80 ms intervals. "
-            "ADB output: " +
-            (output.empty() ? std::string("<empty>") : output);
-        return true;
-    }
-
-    const std::string slowInputError = output;
-
-    // Compatibility fallback: try one standard text command if the
-    // emulator does not support one of the shell features above.
-    arguments =
-        L"-s " + serial +
-        L" shell input keyboard text " + text;
-
-    output = ExecuteADB(arguments, 15000);
-
-    if (IsADBError(output) || IsAndroidInputError(output))
-    {
-        diagnostic =
-            "Slow per-character input and bulk input both failed. "
-            "Per-character: " + slowInputError +
-            " Bulk: " + output;
         return false;
     }
 
+    const std::wstring text = Utf8ToWide(value);
+
+    // KEYEVENTF_UNICODE makes Windows deliver real keyboard character
+    // events to the focused LDPlayer render window, one character at a time.
+    for (wchar_t ch : text)
+    {
+        INPUT events[2]{};
+
+        events[0].type = INPUT_KEYBOARD;
+        events[0].ki.wScan = ch;
+        events[0].ki.dwFlags = KEYEVENTF_UNICODE;
+
+        events[1].type = INPUT_KEYBOARD;
+        events[1].ki.wScan = ch;
+        events[1].ki.dwFlags =
+            KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+
+        if (SendInput(2, events, sizeof(INPUT)) != 2)
+        {
+            diagnostic =
+                "Unicode keyboard input failed. Win32 error: " +
+                std::to_string(GetLastError());
+            return false;
+        }
+
+        Sleep(55);
+    }
+
     diagnostic =
-        "Text sent using bulk Android keyboard input fallback. "
-        "ADB output: " +
-        (output.empty() ? std::string("<empty>") : output);
+        "REAL WINDOWS KEYBOARD: typed " +
+        std::to_string(text.size()) +
+        " characters through SendInput.";
+
     return true;
 }
-
-// ============================================================
-// VERIFY ENTERED NAMES
-// ============================================================
 
 bool VerifyEnteredNamesADB(
     const std::string& deviceId,
@@ -2321,81 +2556,118 @@ void StartPhotonAutomation()
         return;
     }
 
+    // A single selected window is a convenient default for a single device.
+    if (selectedDevices.size() == 1 &&
+        !IsWindow(selectedDevices[0].automationWindow) &&
+        g_SelectedWindow >= 0 &&
+        g_SelectedWindow < static_cast<int>(g_EmulatorWindows.size()))
+    {
+        selectedDevices[0].automationWindow =
+            g_EmulatorWindows[g_SelectedWindow].handle;
+    }
+
+    // Validate all explicit device-to-window mappings before starting.
+    std::vector<HWND> usedWindows;
+    for (const ADBDevice& device : selectedDevices)
+    {
+        if (!device.automationWindow ||
+            !IsWindow(device.automationWindow))
+        {
+            g_Notification =
+                "Assign an LDPlayer window to each selected ADB device "
+                "in Emulator Manager.";
+            return;
+        }
+
+        if (std::find(
+            usedWindows.begin(),
+            usedWindows.end(),
+            device.automationWindow) != usedWindows.end())
+        {
+            g_Notification =
+                "Each selected ADB device must use a different LDPlayer window.";
+            return;
+        }
+
+        usedWindows.push_back(device.automationWindow);
+    }
+
     if (g_AutomationThread.joinable())
         g_AutomationThread.join();
 
     {
         std::lock_guard<std::mutex> lock(g_LogMutex);
         g_PhotonDetectionLog =
-            "Starting PHOTON automation...\n";
+            "Starting PHOTON automation with REAL WINDOWS INPUT...\n";
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_DeviceWindowMapMutex);
+        g_DeviceWindowMap.clear();
+
+        for (const ADBDevice& device : selectedDevices)
+            g_DeviceWindowMap[device.id] = device.automationWindow;
     }
 
     g_AutomationBusy = true;
-    g_Notification = "PHOTON automation is running...";
+    g_Notification = "PHOTON automation is running with real mouse/keyboard...";
 
-    // Snapshot password on the UI thread before starting workers.
     const std::string passwordSnapshot = g_RegistrationPassword;
 
     g_AutomationThread = std::thread(
         [selectedDevices, passwordSnapshot]()
         {
-            std::vector<std::string> deviceLogs(
-                selectedDevices.size()
-            );
-
             std::vector<AutomationResult> results(
                 selectedDevices.size()
             );
 
-            std::vector<std::thread> workers;
+            std::vector<std::string> deviceLogs(
+                selectedDevices.size()
+            );
 
+            // IMPORTANT: physical desktop input is global, so devices must
+            // run one after another. Parallel input would interleave keys
+            // and mouse clicks between emulator windows.
             for (size_t i = 0; i < selectedDevices.size(); ++i)
             {
-                workers.emplace_back(
-                    [&, i]()
-                    {
-                        std::ostringstream log;
+                std::ostringstream log;
+                log << "\n========================================\n";
+                log << "DEVICE " << (i + 1) << "/"
+                    << selectedDevices.size() << ": "
+                    << selectedDevices[i].id << "\n";
+                log << "INPUT MODE: REAL WINDOWS MOUSE + KEYBOARD\n";
+                log << "========================================\n";
 
-                        try
-                        {
-                            results[i] = RunPhotonAutomation(
-                                selectedDevices[i],
-                                log,
-                                passwordSnapshot
-                            );
-                        }
-                        catch (const cv::Exception& e)
-                        {
-                            log << "OpenCV exception: "
-                                << e.what() << "\n";
-                        }
-                        catch (const std::exception& e)
-                        {
-                            log << "C++ exception: "
-                                << e.what() << "\n";
-                        }
-                        catch (...)
-                        {
-                            log << "Unknown automation exception.\n";
-                        }
+                try
+                {
+                    results[i] = RunPhotonAutomation(
+                        selectedDevices[i],
+                        log,
+                        passwordSnapshot
+                    );
+                }
+                catch (const cv::Exception& e)
+                {
+                    log << "OpenCV exception: " << e.what() << "\n";
+                }
+                catch (const std::exception& e)
+                {
+                    log << "C++ exception: " << e.what() << "\n";
+                }
+                catch (...)
+                {
+                    log << "Unknown automation exception.\n";
+                }
 
-                        deviceLogs[i] = log.str();
-                    }
-                );
-            }
-
-            for (std::thread& worker : workers)
-            {
-                if (worker.joinable())
-                    worker.join();
+                deviceLogs[i] = log.str();
             }
 
             int successCount = 0;
             int failedCount = 0;
 
             std::ostringstream finalLog;
-
             finalLog << "PHOTON AUTOMATION RESULTS\n";
+            finalLog << "Input mode: real Windows mouse and keyboard\n";
             finalLog << "Selected devices: "
                 << selectedDevices.size() << "\n";
 
@@ -2417,6 +2689,11 @@ void StartPhotonAutomation()
             {
                 std::lock_guard<std::mutex> lock(g_LogMutex);
                 g_PhotonDetectionLog = finalLog.str();
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(g_DeviceWindowMapMutex);
+                g_DeviceWindowMap.clear();
             }
 
             g_Notification =
@@ -2483,6 +2760,7 @@ void RefreshADBDevices()
             if (previous.id == device.id)
             {
                 device.selected = previous.selected;
+                device.automationWindow = previous.automationWindow;
                 break;
             }
         }
@@ -2546,6 +2824,9 @@ void RefreshEmulatorWindows()
     g_SelectedWindow = -1;
 
     EnumWindows(EnumEmulatorWindows, 0);
+
+    if (g_EmulatorWindows.size() == 1)
+        g_SelectedWindow = 0;
 
     g_Notification = "Emulator windows refreshed";
 }
@@ -2775,6 +3056,10 @@ void DrawEmulatorManager()
     );
 
     ImGui::Text("ADB DEVICES");
+    ImGui::TextDisabled(
+        "Assign the matching LDPlayer window to every device. "
+        "Mouse and keyboard input will be visible on the desktop."
+    );
     ImGui::Separator();
 
     int selectedCount = 0;
@@ -2839,6 +3124,52 @@ void DrawEmulatorManager()
             ImGui::SameLine();
 
             ImGui::TextDisabled("| %s", device.model.c_str());
+
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(240.0f);
+
+            std::string mappedWindowLabel = "Assign LDPlayer window";
+            for (size_t windowIndex = 0;
+                windowIndex < g_EmulatorWindows.size();
+                ++windowIndex)
+            {
+                if (g_EmulatorWindows[windowIndex].handle ==
+                    device.automationWindow)
+                {
+                    mappedWindowLabel =
+                        std::to_string(windowIndex + 1) + ". " +
+                        WideToUtf8(g_EmulatorWindows[windowIndex].title);
+                    break;
+                }
+            }
+
+            if (ImGui::BeginCombo(
+                "##ldplayer_mapping",
+                mappedWindowLabel.c_str()))
+            {
+                for (size_t windowIndex = 0;
+                    windowIndex < g_EmulatorWindows.size();
+                    ++windowIndex)
+                {
+                    const EmulatorWindow& candidate =
+                        g_EmulatorWindows[windowIndex];
+
+                    std::string option =
+                        std::to_string(windowIndex + 1) + ". " +
+                        WideToUtf8(candidate.title);
+
+                    const bool isSelected =
+                        device.automationWindow == candidate.handle;
+
+                    if (ImGui::Selectable(option.c_str(), isSelected))
+                        device.automationWindow = candidate.handle;
+
+                    if (isSelected)
+                        ImGui::SetItemDefaultFocus();
+                }
+
+                ImGui::EndCombo();
+            }
 
             ImGui::PopID();
         }
