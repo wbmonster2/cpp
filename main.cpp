@@ -868,6 +868,8 @@ bool TapLoginButton(
                 screenPoint.y - GetSystemMetrics(SM_YVIRTUALSCREEN)) * 65535) /
             std::max(1, GetSystemMetrics(SM_CYVIRTUALSCREEN) - 1)
         );
+        move.mi.dx = std::clamp<LONG>(move.mi.dx, 0, 65535);
+        move.mi.dy = std::clamp<LONG>(move.mi.dy, 0, 65535);
         move.mi.dwFlags =
             MOUSEEVENTF_MOVE |
             MOUSEEVENTF_ABSOLUTE |
@@ -2661,7 +2663,7 @@ std::pair<std::string, std::string> GenerateRoleplayName(
     // The base lists are preferred, but fictional candidates are mixed in
     // randomly so the generated account names do not look like a fixed list.
     for (int attempt = 0;
-        attempt < 1200 && uniqueFirstNames.size() < firstNames.size() + 500;
+        attempt < 5000 && uniqueFirstNames.size() < firstNames.size() + 500;
         ++attempt)
     {
         const std::string candidate =
@@ -2678,7 +2680,7 @@ std::pair<std::string, std::string> GenerateRoleplayName(
     }
 
     for (int attempt = 0;
-        attempt < 1200 && uniqueLastNames.size() < lastNames.size() + 500;
+        attempt < 5000 && uniqueLastNames.size() < lastNames.size() + 500;
         ++attempt)
     {
         const std::string candidate =
@@ -2747,6 +2749,9 @@ std::pair<std::string, std::string> GenerateRoleplayName(
             {
                 const std::string lastKey =
                     normalizeName(uniqueLastNames[lastIndex]);
+
+                if (usedLastNames.find(lastKey) != usedLastNames.end())
+                    continue;
 
                 const std::string fullKey = firstKey + "_" + lastKey;
 
@@ -3089,7 +3094,11 @@ AutomationResult RunPhotonAutomation(
         password,
         saveDiagnostic))
     {
-        log << "WARNING: " << saveDiagnostic << "\n";
+        log
+            << "ERROR: " << saveDiagnostic << "\n"
+            << "Registration stopped to avoid reusing an identity that "
+            << "could not be saved to the uniqueness history.\n";
+        return result;
     }
     else
     {
