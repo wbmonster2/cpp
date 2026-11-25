@@ -456,6 +456,9 @@ std::wstring DeviceArgument(const std::string& deviceId)
 // ADB INPUT
 // ============================================================
 
+// Implemented below with Android text-input helpers.
+bool IsAndroidInputError(const std::string& output);
+
 bool TapADB(
     const std::string& deviceId,
     int x,
@@ -473,52 +476,56 @@ bool TapADB(
     const std::wstring sx = std::to_wstring(x);
     const std::wstring sy = std::to_wstring(y);
 
-    // Explicit touchscreen source is more reliable for LDPlayer's
-    // WebView/game UI than the generic input tap source.
-    std::wstring command =
-        L"-s " + serial +
-        L" shell input touchscreen tap " + sx + L" " + sy;
-
-    std::string output = ExecuteADB(command, 8000);
-
-    if (!IsADBError(output))
+    // Try the standard Android tap command first. Some LDPlayer builds
+    // accept input tap but silently ignore the explicit touchscreen source.
+    const std::vector<std::pair<std::wstring, std::string>> attempts =
     {
-        diagnostic = "Touchscreen tap sent at (" +
-            std::to_string(x) + ", " + std::to_string(y) + ").";
-        return true;
+        {
+            L"-s " + serial + L" shell input tap " + sx + L" " + sy,
+            "Android input tap"
+        },
+        {
+            L"-s " + serial + L" shell input touchscreen tap " + sx + L" " + sy,
+            "Android touchscreen tap"
+        },
+        {
+            L"-s " + serial + L" shell input touchscreen swipe " +
+                sx + L" " + sy + L" " + sx + L" " + sy + L" 120",
+            "Android touchscreen swipe-tap"
+        },
+        {
+            L"-s " + serial + L" shell input mouse tap " + sx + L" " + sy,
+            "Android mouse tap"
+        }
+    };
+
+    std::string errors;
+
+    for (const auto& attempt : attempts)
+    {
+        const std::string output = ExecuteADB(attempt.first, 8000);
+
+        if (!IsADBError(output) && !IsAndroidInputError(output))
+        {
+            diagnostic =
+                attempt.second + " sent at (" +
+                std::to_string(x) + ", " + std::to_string(y) + ").";
+
+            if (!output.empty())
+                diagnostic += " ADB: " + output;
+
+            return true;
+        }
+
+        if (!errors.empty())
+            errors += " | ";
+
+        errors += attempt.second + ": " +
+            (output.empty() ? std::string("ADB execution failed") : output);
     }
 
-    // Fallback gesture: DOWN/MOVE/UP at the same coordinates.
-    command =
-        L"-s " + serial +
-        L" shell input touchscreen swipe " +
-        sx + L" " + sy + L" " + sx + L" " + sy + L" 120";
-
-    output = ExecuteADB(command, 8000);
-
-    if (!IsADBError(output))
-    {
-        diagnostic = "Touchscreen swipe-tap sent at (" +
-            std::to_string(x) + ", " + std::to_string(y) + ").";
-        return true;
-    }
-
-    // Last fallback for LDPlayer images exposing a mouse input source.
-    command =
-        L"-s " + serial +
-        L" shell input mouse tap " + sx + L" " + sy;
-
-    output = ExecuteADB(command, 8000);
-
-    if (IsADBError(output))
-    {
-        diagnostic = "Touch input failed: " + output;
-        return false;
-    }
-
-    diagnostic = "Mouse tap sent at (" +
-        std::to_string(x) + ", " + std::to_string(y) + ").";
-    return true;
+    diagnostic = "All tap methods failed. " + errors;
+    return false;
 }
 
 bool SendBackspaceADB(
@@ -559,13 +566,27 @@ bool ClearADBTextField(
     int y,
     std::string& diagnostic)
 {
-    if (!TapADB(deviceId, x, y, diagnostic))
-        return false;
+    std::string tapDiagnostic;
 
-    Sleep(150);
-
-    if (!SendBackspaceADB(deviceId, 20, diagnostic))
+    if (!TapADB(deviceId, x, y, tapDiagnostic))
+    {
+        diagnostic = "Field tap failed: " + tapDiagnostic;
         return false;
+    }
+
+    Sleep(250);
+
+    std::string backspaceDiagnostic;
+    if (!SendBackspaceADB(deviceId, 20, backspaceDiagnostic))
+    {
+        diagnostic =
+            "Field was tapped using " + tapDiagnostic +
+            " but clearing failed: " + backspaceDiagnostic;
+        return false;
+    }
+
+    diagnostic =
+        tapDiagnostic + " " + backspaceDiagnostic;
 
     return true;
 }
