@@ -2130,7 +2130,15 @@ bool DetectInputField(
             "% at (" + std::to_string(center.x) +
             ", " + std::to_string(center.y) + ").";
 
-        return confidence >= 0.76;
+        // The WebView input placeholders are rendered with slightly different
+        // anti-aliasing on different LDPlayer instances. Accept weaker matches
+        // only inside the known registration-form area; WaitForInputField still
+        // requires two consecutive matching frames before clicking.
+        const bool plausibleFieldPosition =
+            center.x >= 60 && center.x <= 420 &&
+            center.y >= 160 && center.y <= 420;
+
+        return plausibleFieldPosition && confidence >= 0.52;
     }
     catch (const cv::Exception& e)
     {
