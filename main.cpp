@@ -677,6 +677,11 @@ bool InputADBText(
         (output.empty() ? std::string("<empty>") : output);
     return true;
 }
+
+// ============================================================
+// VERIFY ENTERED NAMES
+// ============================================================
+
 bool VerifyEnteredNamesADB(
     const std::string& deviceId,
     const std::string& firstName,
