@@ -606,8 +606,8 @@ bool ActivateEmulatorWindow(
         return false;
     }
 
-    // Find the game surface again on every action. This keeps coordinates
-    // correct even after the user moves or resizes an LDPlayer window.
+    // Recalculate the actual game surface for every action. The user may
+    // freely move or resize LDPlayer windows while automation is running.
     renderWindow = FindEmulatorRenderWindow(topLevelWindow);
 
     if (!renderWindow || !IsWindow(renderWindow))
@@ -619,9 +619,6 @@ bool ActivateEmulatorWindow(
     if (IsIconic(topLevelWindow))
         ShowWindow(topLevelWindow, SW_RESTORE);
 
-    // Explicitly move this instance to the top of the Z-order. When several
-    // LDPlayer windows are open, a visible but covered window cannot receive
-    // a real desktop click even though SetCursorPos succeeds.
     SetWindowPos(
         topLevelWindow,
         HWND_TOP,
@@ -629,7 +626,7 @@ bool ActivateEmulatorWindow(
         SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
     );
 
-    // Ensure the worker thread has a queue before attaching input queues.
+    // Ensure this worker thread has a message queue before attaching input.
     MSG queueMessage{};
     PeekMessageW(
         &queueMessage,
@@ -639,15 +636,34 @@ bool ActivateEmulatorWindow(
         PM_NOREMOVE
     );
 
+    const HWND previousForeground = GetForegroundWindow();
+    const DWORD foregroundThreadId = previousForeground
+        ? GetWindowThreadProcessId(previousForeground, nullptr)
+        : 0;
     const DWORD targetThreadId =
         GetWindowThreadProcessId(topLevelWindow, nullptr);
     const DWORD currentThreadId = GetCurrentThreadId();
 
-    bool attached = false;
+    // Attach to both the current foreground queue and LDPlayer's queue.
+    // This is important when switching between several separate emulator windows.
+    bool attachedForeground = false;
+    bool attachedTarget = false;
 
-    if (targetThreadId != 0 && targetThreadId != currentThreadId)
+    if (foregroundThreadId != 0 &&
+        foregroundThreadId != currentThreadId)
     {
-        attached = AttachThreadInput(
+        attachedForeground = AttachThreadInput(
+            currentThreadId,
+            foregroundThreadId,
+            TRUE
+        ) != FALSE;
+    }
+
+    if (targetThreadId != 0 &&
+        targetThreadId != currentThreadId &&
+        targetThreadId != foregroundThreadId)
+    {
+        attachedTarget = AttachThreadInput(
             currentThreadId,
             targetThreadId,
             TRUE
@@ -659,7 +675,6 @@ bool ActivateEmulatorWindow(
     SetActiveWindow(topLevelWindow);
     SetFocus(renderWindow);
 
-    // Small synchronization pause only; previous 120 ms was unnecessary.
     Sleep(25);
 
     HWND foreground = GetForegroundWindow();
@@ -675,19 +690,24 @@ bool ActivateEmulatorWindow(
         foregroundRoot == topLevelWindow ||
         foregroundRootOwner == topLevelWindow;
 
-    if (attached)
+    if (attachedTarget)
         AttachThreadInput(currentThreadId, targetThreadId, FALSE);
+
+    if (attachedForeground)
+        AttachThreadInput(currentThreadId, foregroundThreadId, FALSE);
 
     if (!isForeground)
     {
         diagnostic =
-            "LDPlayer did not become the foreground window. "
-            "The real mouse click was cancelled to avoid clicking another app.";
+            "Foreground activation failed for this LDPlayer instance. "
+            "Mouse action cancelled rather than clicking another window.";
         return false;
     }
 
     diagnostic =
-        "LDPlayer focused and raised. Current render HWND: " +
+        "Focused LDPlayer HWND " +
+        std::to_string(reinterpret_cast<uintptr_t>(topLevelWindow)) +
+        ", render HWND " +
         std::to_string(reinterpret_cast<uintptr_t>(renderWindow)) + ".";
 
     return true;
@@ -914,7 +934,7 @@ bool TapADB(
         return false;
     }
 
-    Sleep(12);
+    Sleep(28);
 
     if (SendInput(1, &up, sizeof(INPUT)) != 1)
     {
