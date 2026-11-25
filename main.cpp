@@ -586,6 +586,25 @@ bool IsSafeADBText(const std::string& value)
     return true;
 }
 
+// Detect errors printed by Android's input command even when the adb
+// process itself exits with code 0. Checking only the Windows process
+// exit code can incorrectly treat "Unknown command" as successful input.
+bool IsAndroidInputError(const std::string& output)
+{
+    std::string lower = output;
+    std::transform(
+        lower.begin(),
+        lower.end(),
+        lower.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); }
+    );
+
+    return lower.find("error:") != std::string::npos ||
+        lower.find("unknown command") != std::string::npos ||
+        lower.find("usage: input") != std::string::npos ||
+        lower.find("input: not found") != std::string::npos;
+}
+
 bool InputADBText(
     const std::string& deviceId,
     const std::string& value,
@@ -603,34 +622,44 @@ bool InputADBText(
     const std::wstring serial = DeviceArgument(deviceId);
     const std::wstring text = Utf8ToWide(value);
 
-    // Force the keyboard source; this avoids builds where the default
-    // input source accepts the command but drops characters in WebView.
+    // Android's standard input command supports: input text <value>.
+    // There is no portable "input keyboard text" subcommand; attempting
+    // it can print an error while adb still appears to have succeeded.
     std::wstring command =
-        L"-s " + serial +
-        L" shell input keyboard text " + text;
-
-    std::string output = ExecuteADB(command, 15000);
-
-    if (!IsADBError(output))
-    {
-        diagnostic = "Text sent using explicit Android keyboard source.";
-        return true;
-    }
-
-    // Compatibility fallback for Android builds without source selection.
-    command =
         L"-s " + serial +
         L" shell input text " + text;
 
+    std::string output = ExecuteADB(command, 15000);
+
+    if (!IsADBError(output) && !IsAndroidInputError(output))
+    {
+        diagnostic =
+            "Text injection command completed via Android input text. "
+            "ADB output: " + (output.empty() ? std::string("<empty>") : output);
+        return true;
+    }
+
+    const std::string firstError = output;
+
+    // Quoted shell fallback for LDPlayer builds that parse arguments
+    // differently. Names are restricted to ASCII letters/digits above.
+    command =
+        L"-s " + serial +
+        L" shell \"input text '" + text + L"' \"";
+
     output = ExecuteADB(command, 15000);
 
-    if (IsADBError(output))
+    if (IsADBError(output) || IsAndroidInputError(output))
     {
-        diagnostic = "Keyboard and standard text input both failed: " + output;
+        diagnostic =
+            "Both Android text-input forms failed. First: " + firstError +
+            " Second: " + output;
         return false;
     }
 
-    diagnostic = "Text sent using standard Android input-text fallback.";
+    diagnostic =
+        "Text injection command completed via quoted Android input text. "
+        "ADB output: " + (output.empty() ? std::string("<empty>") : output);
     return true;
 }
 
