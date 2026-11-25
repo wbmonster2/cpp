@@ -1284,7 +1284,8 @@ bool IsSafeADBText(const std::string& value)
 bool InputADBText(
     const std::string& deviceId,
     const std::string& value,
-    std::string& diagnostic)
+    std::string& diagnostic,
+    bool activateWindow = true)
 {
     if (!IsSafeADBText(value))
     {
@@ -1297,11 +1298,12 @@ bool InputADBText(
     HWND topLevelWindow = nullptr;
     HWND renderWindow = nullptr;
 
-    if (!ActivateEmulatorWindow(
-        deviceId,
-        topLevelWindow,
-        renderWindow,
-        diagnostic))
+    if (activateWindow &&
+        !ActivateEmulatorWindow(
+            deviceId,
+            topLevelWindow,
+            renderWindow,
+            diagnostic))
     {
         return false;
     }
@@ -1388,7 +1390,7 @@ bool InputADBText(
             return false;
         }
 
-        Sleep(55);
+        Sleep(75);
     }
 
     diagnostic =
@@ -2164,9 +2166,9 @@ bool WaitForInputField(
             consecutiveMatches++;
             center = currentCenter;
 
-            if (consecutiveMatches >= 1)
+            if (consecutiveMatches >= 2)
             {
-                diagnostic = "INPUT FIELD CONFIRMED. " + currentDiagnostic;
+                diagnostic = "INPUT FIELD CONFIRMED IN TWO FRAMES. " + currentDiagnostic;
                 return true;
             }
         }
@@ -2176,7 +2178,7 @@ bool WaitForInputField(
         }
 
         lastDiagnostic = currentDiagnostic;
-        Sleep(50);
+        Sleep(100);
     }
 
     diagnostic =
@@ -2341,11 +2343,11 @@ bool WaitForStage(
             consecutive++;
             center = currentCenter;
 
-            if (consecutive >= 1)
+            if (consecutive >= 2)
             {
                 diagnostic =
                     templateName +
-                    ".png detected. " +
+                    ".png detected in two consecutive frames. " +
                     lastDiagnostic;
 
                 return true;
@@ -3088,10 +3090,10 @@ AutomationResult RunPhotonAutomation(
     }
 
     log << "FIRST NAME FIELD: " << nameDiagnostic << "\n";
-    Sleep(90);
+    Sleep(350);
 
     std::string inputDiagnostic;
-    if (!InputADBText(device.id, firstName, inputDiagnostic))
+    if (!InputADBText(device.id, firstName, inputDiagnostic, false))
     {
         log << "FIRST NAME INPUT ERROR: " << inputDiagnostic << "\n";
         return result;
@@ -3135,13 +3137,13 @@ AutomationResult RunPhotonAutomation(
     }
 
     log << "LAST NAME FIELD: " << surnameDiagnostic << "\n";
-    Sleep(90);
+    Sleep(350);
 
     log << "\nGENERATED LAST NAME: " << lastName << "\n";
     log << "CREDENTIALS: login - \"" << firstName << "_"
         << lastName << "\", password - \"" << password << "\"\n";
 
-    if (!InputADBText(device.id, lastName, inputDiagnostic))
+    if (!InputADBText(device.id, lastName, inputDiagnostic, false))
     {
         log << "LAST NAME INPUT ERROR: " << inputDiagnostic << "\n";
         return result;
@@ -3234,12 +3236,14 @@ AutomationResult RunPhotonAutomation(
         return result;
     }
 
-    Sleep(75);
+    // Let the password control finish its transition and receive focus.
+    Sleep(900);
 
     if (!InputADBText(
         device.id,
         password,
-        inputDiagnostic))
+        inputDiagnostic,
+        false))
     {
         log << "PASSWORD INPUT ERROR: "
             << inputDiagnostic << "\n";
@@ -3280,12 +3284,15 @@ AutomationResult RunPhotonAutomation(
         return result;
     }
 
-    Sleep(200);
+    // The repeat-password screen can animate for roughly two seconds.
+    // Wait before typing and do not reactivate the window after tapping the field.
+    Sleep(1400);
 
     if (!InputADBText(
         device.id,
         password,
-        inputDiagnostic))
+        inputDiagnostic,
+        false))
     {
         log << "REPEAT PASSWORD INPUT ERROR: "
             << inputDiagnostic << "\n";
