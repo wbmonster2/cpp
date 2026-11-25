@@ -2155,43 +2155,74 @@ bool WaitForInputField(
     int timeoutMs = 45000)
 {
     const ULONGLONG started = GetTickCount64();
-    int consecutiveMatches = 0;
+
+    // WebView placeholders can flicker or shift slightly between ADB frames.
+    // Use a small rolling sample instead of demanding adjacent matching frames.
+    constexpr int SAMPLE_WINDOW = 5;
+    constexpr int REQUIRED_MATCHES = 2;
+
+    int framesInWindow = 0;
+    int matchesInWindow = 0;
     double confidence = 0.0;
+    double bestConfidence = -1.0;
+    POINT bestCenter{};
     std::string lastDiagnostic;
+    std::string bestDiagnostic;
 
     while (GetTickCount64() - started < static_cast<ULONGLONG>(timeoutMs))
     {
         POINT currentCenter{};
         std::string currentDiagnostic;
+        double currentConfidence = 0.0;
 
-        if (DetectInputField(
+        const bool found = DetectInputField(
             deviceId,
             templateName,
-            confidence,
+            currentConfidence,
             currentCenter,
-            currentDiagnostic))
-        {
-            consecutiveMatches++;
-            center = currentCenter;
+            currentDiagnostic
+        );
 
-            if (consecutiveMatches >= 2)
+        ++framesInWindow;
+        lastDiagnostic = currentDiagnostic;
+
+        if (found)
+        {
+            ++matchesInWindow;
+
+            if (currentConfidence > bestConfidence)
             {
-                diagnostic = "INPUT FIELD CONFIRMED IN TWO FRAMES. " + currentDiagnostic;
+                bestConfidence = currentConfidence;
+                bestCenter = currentCenter;
+                bestDiagnostic = currentDiagnostic;
+            }
+
+            if (matchesInWindow >= REQUIRED_MATCHES)
+            {
+                center = bestCenter;
+                diagnostic =
+                    "INPUT FIELD CONFIRMED IN " +
+                    std::to_string(REQUIRED_MATCHES) +
+                    " OF " + std::to_string(SAMPLE_WINDOW) +
+                    " FRAMES. Best match: " + bestDiagnostic;
                 return true;
             }
         }
-        else
+
+        if (framesInWindow >= SAMPLE_WINDOW)
         {
-            consecutiveMatches = 0;
+            framesInWindow = 0;
+            matchesInWindow = 0;
         }
 
-        lastDiagnostic = currentDiagnostic;
         Sleep(100);
     }
 
     diagnostic =
         "TIMEOUT waiting for " + templateName +
-        ".png. Last result: " + lastDiagnostic;
+        ".png. Best match during search: " +
+        (bestDiagnostic.empty() ? lastDiagnostic : bestDiagnostic) +
+        ". Last frame: " + lastDiagnostic;
     return false;
 }
 
