@@ -54,10 +54,10 @@ static constexpr int AFTER_LOGIN_TIMEOUT_MS = 45000;
 static constexpr int STAGE_TIMEOUT_MS = 300000;
 
 // Интервал между проверками изображения.
-static constexpr int DETECTION_INTERVAL_MS = 700;
+static constexpr int DETECTION_INTERVAL_MS = 250;
 
 // Пауза перед первым действием.
-static constexpr int INITIAL_DELAY_MS = 5000;
+static constexpr int INITIAL_DELAY_MS = 1200;
 
 // ============================================================
 // GLOBAL STATE
@@ -606,6 +606,8 @@ bool ActivateEmulatorWindow(
         return false;
     }
 
+    // Find the game surface again on every action. This keeps coordinates
+    // correct even after the user moves or resizes an LDPlayer window.
     renderWindow = FindEmulatorRenderWindow(topLevelWindow);
 
     if (!renderWindow || !IsWindow(renderWindow))
@@ -616,11 +618,18 @@ bool ActivateEmulatorWindow(
 
     if (IsIconic(topLevelWindow))
         ShowWindow(topLevelWindow, SW_RESTORE);
-    else
-        ShowWindow(topLevelWindow, SW_SHOW);
 
-    // A worker thread normally has no message queue. Create one before
-    // AttachThreadInput so Windows can temporarily join the input queues.
+    // Explicitly move this instance to the top of the Z-order. When several
+    // LDPlayer windows are open, a visible but covered window cannot receive
+    // a real desktop click even though SetCursorPos succeeds.
+    SetWindowPos(
+        topLevelWindow,
+        HWND_TOP,
+        0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+    );
+
+    // Ensure the worker thread has a queue before attaching input queues.
     MSG queueMessage{};
     PeekMessageW(
         &queueMessage,
@@ -630,34 +639,41 @@ bool ActivateEmulatorWindow(
         PM_NOREMOVE
     );
 
-    DWORD targetThreadId =
+    const DWORD targetThreadId =
         GetWindowThreadProcessId(topLevelWindow, nullptr);
+    const DWORD currentThreadId = GetCurrentThreadId();
 
-    DWORD currentThreadId = GetCurrentThreadId();
     bool attached = false;
 
     if (targetThreadId != 0 && targetThreadId != currentThreadId)
+    {
         attached = AttachThreadInput(
             currentThreadId,
             targetThreadId,
             TRUE
         ) != FALSE;
+    }
 
     BringWindowToTop(topLevelWindow);
     SetForegroundWindow(topLevelWindow);
     SetActiveWindow(topLevelWindow);
     SetFocus(renderWindow);
 
-    Sleep(120);
+    // Small synchronization pause only; previous 120 ms was unnecessary.
+    Sleep(25);
 
     HWND foreground = GetForegroundWindow();
     HWND foregroundRoot = foreground
         ? GetAncestor(foreground, GA_ROOT)
         : nullptr;
+    HWND foregroundRootOwner = foreground
+        ? GetAncestor(foreground, GA_ROOTOWNER)
+        : nullptr;
 
     const bool isForeground =
         foreground == topLevelWindow ||
-        foregroundRoot == topLevelWindow;
+        foregroundRoot == topLevelWindow ||
+        foregroundRootOwner == topLevelWindow;
 
     if (attached)
         AttachThreadInput(currentThreadId, targetThreadId, FALSE);
@@ -665,12 +681,15 @@ bool ActivateEmulatorWindow(
     if (!isForeground)
     {
         diagnostic =
-            "Windows did not grant foreground focus to LDPlayer. "
-            "Bring the emulator to the front and try again.";
+            "LDPlayer did not become the foreground window. "
+            "The real mouse click was cancelled to avoid clicking another app.";
         return false;
     }
 
-    diagnostic = "LDPlayer window focused for real desktop input.";
+    diagnostic =
+        "LDPlayer focused and raised. Current render HWND: " +
+        std::to_string(reinterpret_cast<uintptr_t>(renderWindow)) + ".";
+
     return true;
 }
 
@@ -781,7 +800,26 @@ bool TapADB(
         return false;
     }
 
-    // This moves the real desktop cursor to the game control.
+    // Convert to virtual-desktop absolute coordinates. This is more reliable
+    // on multi-monitor / multi-window desktops than a move followed by clicks.
+    const int virtualLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int virtualTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int virtualWidth = std::max(1, GetSystemMetrics(SM_CXVIRTUALSCREEN));
+    const int virtualHeight = std::max(1, GetSystemMetrics(SM_CYVIRTUALSCREEN));
+
+    LONG absoluteX = static_cast<LONG>(
+        (static_cast<long long>(screenPoint.x - virtualLeft) * 65535) /
+        std::max(1, virtualWidth - 1)
+    );
+
+    LONG absoluteY = static_cast<LONG>(
+        (static_cast<long long>(screenPoint.y - virtualTop) * 65535) /
+        std::max(1, virtualHeight - 1)
+    );
+
+    absoluteX = std::clamp<LONG>(absoluteX, 0, 65535);
+    absoluteY = std::clamp<LONG>(absoluteY, 0, 65535);
+
     if (!SetCursorPos(screenPoint.x, screenPoint.y))
     {
         diagnostic =
@@ -790,7 +828,75 @@ bool TapADB(
         return false;
     }
 
-    Sleep(90);
+    // Verify the target is actually under the pointer. This catches overlapping
+    // emulator windows and stale HWND mappings before the click is sent.
+    HWND windowUnderPoint = WindowFromPoint(screenPoint);
+    HWND underRoot = windowUnderPoint
+        ? GetAncestor(windowUnderPoint, GA_ROOT)
+        : nullptr;
+    HWND underRootOwner = windowUnderPoint
+        ? GetAncestor(windowUnderPoint, GA_ROOTOWNER)
+        : nullptr;
+
+    if (underRoot != topLevelWindow &&
+        underRootOwner != topLevelWindow &&
+        windowUnderPoint != topLevelWindow)
+    {
+        // Raise the mapped LDPlayer once more, then re-check.
+        SetWindowPos(
+            topLevelWindow,
+            HWND_TOP,
+            0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+        );
+        BringWindowToTop(topLevelWindow);
+        SetForegroundWindow(topLevelWindow);
+        Sleep(15);
+
+        SetCursorPos(screenPoint.x, screenPoint.y);
+        windowUnderPoint = WindowFromPoint(screenPoint);
+        underRoot = windowUnderPoint
+            ? GetAncestor(windowUnderPoint, GA_ROOT)
+            : nullptr;
+        underRootOwner = windowUnderPoint
+            ? GetAncestor(windowUnderPoint, GA_ROOTOWNER)
+            : nullptr;
+    }
+
+    if (underRoot != topLevelWindow &&
+        underRootOwner != topLevelWindow &&
+        windowUnderPoint != topLevelWindow)
+    {
+        wchar_t className[128]{};
+        if (windowUnderPoint)
+            GetClassNameW(windowUnderPoint, className, 128);
+
+        diagnostic =
+            "Click cancelled: another window covers the target point. "
+            "Covered HWND=" +
+            std::to_string(reinterpret_cast<uintptr_t>(windowUnderPoint)) +
+            ", class=" + WideToUtf8(className) +
+            ". Move LDPlayer windows so the target area is not covered.";
+        return false;
+    }
+
+    // Use a real absolute mouse-move event and then a short down/up pair.
+    INPUT move{};
+    move.type = INPUT_MOUSE;
+    move.mi.dx = absoluteX;
+    move.mi.dy = absoluteY;
+    move.mi.dwFlags =
+        MOUSEEVENTF_MOVE |
+        MOUSEEVENTF_ABSOLUTE |
+        MOUSEEVENTF_VIRTUALDESK;
+
+    if (SendInput(1, &move, sizeof(INPUT)) != 1)
+    {
+        diagnostic =
+            "SendInput mouse move failed. Win32 error: " +
+            std::to_string(GetLastError());
+        return false;
+    }
 
     INPUT down{};
     down.type = INPUT_MOUSE;
@@ -808,24 +914,26 @@ bool TapADB(
         return false;
     }
 
-    Sleep(45);
+    Sleep(12);
 
     if (SendInput(1, &up, sizeof(INPUT)) != 1)
     {
+        // Avoid leaving the physical left button logically held.
+        mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+
         diagnostic =
             "Mouse left-up failed. Win32 error: " +
             std::to_string(GetLastError());
         return false;
     }
 
-    Sleep(100);
-
     diagnostic =
         "REAL WINDOWS MOUSE CLICK at game coordinates (" +
         std::to_string(x) + ", " + std::to_string(y) +
         "), desktop coordinates (" +
         std::to_string(screenPoint.x) + ", " +
-        std::to_string(screenPoint.y) + ").";
+        std::to_string(screenPoint.y) +
+        "); unobstructed target HWND confirmed.";
 
     return true;
 }
@@ -854,14 +962,14 @@ bool SendBackspaceADB(
     if (!SendVirtualKey(VK_END, diagnostic))
         return false;
 
-    Sleep(80);
+    Sleep(25);
 
     for (int i = 0; i < count; ++i)
     {
         if (!SendVirtualKey(VK_BACK, diagnostic))
             return false;
 
-        Sleep(22);
+        Sleep(8);
     }
 
     diagnostic =
@@ -886,7 +994,7 @@ bool ClearADBTextField(
         return false;
     }
 
-    Sleep(250);
+    Sleep(80);
 
     std::string backspaceDiagnostic;
     if (!SendBackspaceADB(deviceId, 20, backspaceDiagnostic))
@@ -1814,7 +1922,7 @@ bool WaitForInputField(
         }
 
         lastDiagnostic = currentDiagnostic;
-        Sleep(450);
+        Sleep(200);
     }
 
     diagnostic =
@@ -1877,7 +1985,7 @@ bool WaitForPhotonReady(
             consecutive = 0;
         }
 
-        Sleep(450);
+        Sleep(200);
     }
 
     diagnostic =
@@ -1929,7 +2037,7 @@ bool WaitForPhotonAfterLogin(
             consecutive = 0;
         }
 
-        Sleep(500);
+        Sleep(250);
     }
 
     diagnostic =
@@ -2542,7 +2650,7 @@ AutomationResult RunPhotonAutomation(
             if (stillVisible)
             {
                 loginCenter = retryCenter;
-                Sleep(700);
+                Sleep(180);
             }
             else
             {
@@ -2607,7 +2715,7 @@ AutomationResult RunPhotonAutomation(
     }
 
     log << "FIRST NAME FIELD: " << nameDiagnostic << "\n";
-    Sleep(250);
+    Sleep(90);
 
     std::string inputDiagnostic;
     if (!InputADBText(device.id, firstName, inputDiagnostic))
@@ -2617,7 +2725,7 @@ AutomationResult RunPhotonAutomation(
     }
 
     log << "FIRST NAME INPUT: " << inputDiagnostic << "\n";
-    Sleep(700);
+    Sleep(180);
 
     // --------------------------------------------------------
     // STEP 4: FIND, CLEAR AND FILL SURNAME FIELD
@@ -2654,7 +2762,7 @@ AutomationResult RunPhotonAutomation(
     }
 
     log << "LAST NAME FIELD: " << surnameDiagnostic << "\n";
-    Sleep(250);
+    Sleep(90);
 
     log << "\nGENERATED LAST NAME: " << lastName << "\n";
     log << "CREDENTIALS: login - \"" << firstName << "_"
@@ -2667,7 +2775,7 @@ AutomationResult RunPhotonAutomation(
     }
 
     log << "LAST NAME INPUT: " << inputDiagnostic << "\n";
-    Sleep(700);
+    Sleep(180);
 
     // --------------------------------------------------------
     // STEP 5: CONFIRM INPUT COMMANDS
@@ -2715,7 +2823,7 @@ AutomationResult RunPhotonAutomation(
         return result;
     }
 
-    Sleep(900);
+    Sleep(250);
 
     // --------------------------------------------------------
     // STEP 8: WAIT FOR PASSWORD FIELD
@@ -2749,7 +2857,7 @@ AutomationResult RunPhotonAutomation(
         return result;
     }
 
-    Sleep(200);
+    Sleep(75);
 
     if (!InputADBText(
         device.id,
