@@ -2121,7 +2121,7 @@ bool LoadUsedRoleplayNames(
         return false;
     }
 
-    std::string contents(static_cast<size_t>(fileSize.QuadPart), '\\0');
+    std::string contents(static_cast<size_t>(fileSize.QuadPart), '\0');
     size_t totalRead = 0;
 
     while (totalRead < contents.size())
