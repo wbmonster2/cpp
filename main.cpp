@@ -80,6 +80,55 @@ static std::mutex g_LogMutex;
 
 static char g_RegistrationPassword[128] = "SmartClick123";
 
+// Streams worker-thread log output directly into the UI-visible log.
+// Every write is protected so the render thread can safely take a snapshot.
+class LivePhotonLogBuffer : public std::streambuf
+{
+protected:
+    std::streamsize xsputn(
+        const char* data,
+        std::streamsize count) override
+    {
+        if (data && count > 0)
+        {
+            std::lock_guard<std::mutex> lock(g_LogMutex);
+            g_PhotonDetectionLog.append(
+                data,
+                static_cast<size_t>(count)
+            );
+        }
+
+        return count;
+    }
+
+    int_type overflow(int_type character) override
+    {
+        if (!traits_type::eq_int_type(
+            character,
+            traits_type::eof()))
+        {
+            const char value =
+                traits_type::to_char_type(character);
+
+            std::lock_guard<std::mutex> lock(g_LogMutex);
+            g_PhotonDetectionLog.push_back(value);
+        }
+
+        return traits_type::not_eof(character);
+    }
+
+    int sync() override
+    {
+        return 0;
+    }
+};
+
+static void AppendPhotonLog(const std::string& message)
+{
+    std::lock_guard<std::mutex> lock(g_LogMutex);
+    g_PhotonDetectionLog += message;
+}
+
 // ============================================================
 // IMAGE TEMPLATES
 // ============================================================
@@ -1962,7 +2011,7 @@ bool WaitForStage(
 bool WaitAndTapStage(
     const std::string& deviceId,
     const std::string& templateName,
-    std::ostringstream& log)
+    std::ostream& log)
 {
     log << "\nWAITING FOR " << templateName << ".png\n";
 
@@ -2113,7 +2162,7 @@ std::pair<std::string, std::string> GenerateRoleplayName(
 
 AutomationResult RunPhotonAutomation(
     const ADBDevice& device,
-    std::ostringstream& log,
+    std::ostream& log,
     const std::string& password)
 {
     AutomationResult result;
@@ -2574,6 +2623,7 @@ void StartPhotonAutomation()
     if (!g_TemplatesLoaded)
     {
         g_Notification = "Login templates are missing.";
+        AppendPhotonLog("[START BLOCKED] Login templates are missing.\n");
         return;
     }
 
@@ -2581,6 +2631,10 @@ void StartPhotonAutomation()
     {
         g_Notification =
             "Some registration PNG templates are missing.";
+        AppendPhotonLog(
+            "[START BLOCKED] Registration templates are missing.\n" +
+            g_TemplateStatus + "\n"
+        );
         return;
     }
 
@@ -2588,6 +2642,9 @@ void StartPhotonAutomation()
     {
         g_Notification =
             "Password must use English letters and digits only.";
+        AppendPhotonLog(
+            "[START BLOCKED] Password must use English letters and digits only.\n"
+        );
         return;
     }
 
@@ -2602,6 +2659,7 @@ void StartPhotonAutomation()
     if (selectedDevices.empty())
     {
         g_Notification = "Select at least one ADB device.";
+        AppendPhotonLog("[START BLOCKED] No ADB devices selected.\n");
         return;
     }
 
@@ -2617,6 +2675,7 @@ void StartPhotonAutomation()
 
     // Validate all explicit device-to-window mappings before starting.
     std::vector<HWND> usedWindows;
+
     for (const ADBDevice& device : selectedDevices)
     {
         if (!device.automationWindow ||
@@ -2625,6 +2684,11 @@ void StartPhotonAutomation()
             g_Notification =
                 "Assign an LDPlayer window to each selected ADB device "
                 "in Emulator Manager.";
+
+            AppendPhotonLog(
+                "[START BLOCKED] No valid LDPlayer window assigned to device " +
+                device.id + ".\n"
+            );
             return;
         }
 
@@ -2635,6 +2699,11 @@ void StartPhotonAutomation()
         {
             g_Notification =
                 "Each selected ADB device must use a different LDPlayer window.";
+
+            AppendPhotonLog(
+                "[START BLOCKED] The same LDPlayer window is assigned to more "
+                "than one selected ADB device.\n"
+            );
             return;
         }
 
@@ -2646,6 +2715,7 @@ void StartPhotonAutomation()
 
     {
         std::lock_guard<std::mutex> lock(g_LogMutex);
+        g_PhotonDetectionLog.clear();
         g_PhotonDetectionLog =
             "Starting PHOTON automation with REAL WINDOWS INPUT...\n";
     }
@@ -2659,7 +2729,8 @@ void StartPhotonAutomation()
     }
 
     g_AutomationBusy = true;
-    g_Notification = "PHOTON automation is running with real mouse/keyboard...";
+    g_Notification =
+        "PHOTON automation is running with real mouse/keyboard...";
 
     const std::string passwordSnapshot = g_RegistrationPassword;
 
@@ -2670,22 +2741,25 @@ void StartPhotonAutomation()
                 selectedDevices.size()
             );
 
-            std::vector<std::string> deviceLogs(
-                selectedDevices.size()
+            AppendPhotonLog(
+                "Input mode: real Windows mouse and keyboard.\n"
+                "Live diagnostics enabled.\n"
             );
 
-            // IMPORTANT: physical desktop input is global, so devices must
-            // run one after another. Parallel input would interleave keys
-            // and mouse clicks between emulator windows.
+            // Desktop mouse/keyboard are global, so selected emulators
+            // must be automated sequentially rather than in parallel.
             for (size_t i = 0; i < selectedDevices.size(); ++i)
             {
-                std::ostringstream log;
-                log << "\n========================================\n";
-                log << "DEVICE " << (i + 1) << "/"
+                LivePhotonLogBuffer logBuffer;
+                std::ostream log(&logBuffer);
+
+                log
+                    << "\n========================================\n"
+                    << "DEVICE " << (i + 1) << "/"
                     << selectedDevices.size() << ": "
-                    << selectedDevices[i].id << "\n";
-                log << "INPUT MODE: REAL WINDOWS MOUSE + KEYBOARD\n";
-                log << "========================================\n";
+                    << selectedDevices[i].id << "\n"
+                    << "INPUT MODE: REAL WINDOWS MOUSE + KEYBOARD\n"
+                    << "========================================\n";
 
                 try
                 {
@@ -2708,37 +2782,32 @@ void StartPhotonAutomation()
                     log << "Unknown automation exception.\n";
                 }
 
-                deviceLogs[i] = log.str();
+                log
+                    << "DEVICE RESULT: "
+                    << (results[i].success ? "SUCCESS" : "FAILED")
+                    << "\n";
             }
 
             int successCount = 0;
             int failedCount = 0;
 
-            std::ostringstream finalLog;
-            finalLog << "PHOTON AUTOMATION RESULTS\n";
-            finalLog << "Input mode: real Windows mouse and keyboard\n";
-            finalLog << "Selected devices: "
-                << selectedDevices.size() << "\n";
-
-            for (size_t i = 0; i < selectedDevices.size(); ++i)
+            for (const AutomationResult& result : results)
             {
-                finalLog << deviceLogs[i];
-
-                if (results[i].success)
+                if (result.success)
                     successCount++;
                 else
                     failedCount++;
             }
 
-            finalLog << "\n========================================\n";
-            finalLog << "SUCCESS: " << successCount << "\n";
-            finalLog << "FAILED: " << failedCount << "\n";
-            finalLog << "========================================\n";
+            std::ostringstream summary;
+            summary
+                << "\n========================================\n"
+                << "PHOTON AUTOMATION FINISHED\n"
+                << "SUCCESS: " << successCount << "\n"
+                << "FAILED: " << failedCount << "\n"
+                << "========================================\n";
 
-            {
-                std::lock_guard<std::mutex> lock(g_LogMutex);
-                g_PhotonDetectionLog = finalLog.str();
-            }
+            AppendPhotonLog(summary.str());
 
             {
                 std::lock_guard<std::mutex> lock(g_DeviceWindowMapMutex);
@@ -3778,22 +3847,74 @@ void DrawLogs()
 {
     DrawSectionTitle(
         "LOGS",
-        "Application activity"
+        "Live automation diagnostics and ADB activity"
     );
 
     ImGui::TextWrapped("%s", g_Notification.c_str());
 
     ImGui::Spacing();
 
-    ImGui::Text("Last ADB output:");
+    std::string automationLog;
+    {
+        std::lock_guard<std::mutex> lock(g_LogMutex);
+        automationLog = g_PhotonDetectionLog;
+    }
+
+    ImGui::Text(
+        "PHOTON AUTOMATION LOG%s",
+        g_AutomationBusy.load() ? "  [RUNNING]" : ""
+    );
+
+    ImGui::SameLine();
+
+    if (ImGui::SmallButton("Clear log") &&
+        !g_AutomationBusy.load())
+    {
+        std::lock_guard<std::mutex> lock(g_LogMutex);
+        g_PhotonDetectionLog.clear();
+        automationLog.clear();
+    }
+
+    ImGui::BeginChild(
+        "PhotonLiveLog",
+        ImVec2(0, -115),
+        true,
+        ImGuiWindowFlags_HorizontalScrollbar
+    );
+
+    const bool wasAtBottom =
+        ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 8.0f;
+
+    if (automationLog.empty())
+    {
+        ImGui::TextDisabled(
+            "Automation log is empty. Start PHOTON to see live diagnostics."
+        );
+    }
+    else
+    {
+        ImGui::TextUnformatted(automationLog.c_str());
+    }
+
+    if (wasAtBottom || g_AutomationBusy.load())
+        ImGui::SetScrollHereY(1.0f);
+
+    ImGui::EndChild();
+
+    ImGui::Spacing();
+    ImGui::Text("LAST ADB OUTPUT");
 
     ImGui::BeginChild(
         "ADBLogOutput",
-        ImVec2(0, 0),
-        true
+        ImVec2(0, 85),
+        true,
+        ImGuiWindowFlags_HorizontalScrollbar
     );
 
-    ImGui::TextWrapped("%s", g_ADBOutput.c_str());
+    if (g_ADBOutput.empty())
+        ImGui::TextDisabled("No ADB output yet.");
+    else
+        ImGui::TextUnformatted(g_ADBOutput.c_str());
 
     ImGui::EndChild();
 }
