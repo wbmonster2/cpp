@@ -615,58 +615,68 @@ bool InputADBText(
         diagnostic =
             "Text contains unsupported characters. "
             "Use English letters and digits only.";
-
         return false;
     }
 
     const std::wstring serial = DeviceArgument(deviceId);
     const std::wstring text = Utf8ToWide(value);
 
-    // Android's standard input command supports: input text <value>.
-    // There is no portable "input keyboard text" subcommand; attempting
-    // it can print an error while adb still appears to have succeeded.
-    std::wstring command =
-        L"-s " + serial +
-        L" shell input text " + text;
+    // Send characters separately instead of one large burst.
+    // Some embedded game/WebView fields drop fast consecutive key events.
+    std::wstring shellCommand;
 
-    std::string output = ExecuteADB(command, 15000);
+    for (wchar_t ch : text)
+    {
+        if (!shellCommand.empty())
+            shellCommand += L"; sleep 0.08; ";
+
+        shellCommand += L"input keyboard text ";
+        shellCommand += ch;
+    }
+
+    std::wstring arguments =
+        L"-s " + serial +
+        L" shell \"" + shellCommand + L"\"";
+
+    std::string output = ExecuteADB(
+        arguments,
+        static_cast<DWORD>(std::max<size_t>(15000, text.size() * 1200))
+    );
 
     if (!IsADBError(output) && !IsAndroidInputError(output))
     {
         diagnostic =
-            "Text injection command completed via Android input text. "
-            "ADB output: " + (output.empty() ? std::string("<empty>") : output);
+            "Characters sent one by one with 80 ms intervals. "
+            "ADB output: " +
+            (output.empty() ? std::string("<empty>") : output);
         return true;
     }
 
-    const std::string firstError = output;
+    const std::string slowInputError = output;
 
-    // Quoted shell fallback for LDPlayer builds that parse arguments
-    // differently. Names are restricted to ASCII letters/digits above.
-    command =
+    // Compatibility fallback: try one standard text command if the
+    // emulator does not support one of the shell features above.
+    arguments =
         L"-s " + serial +
-        L" shell \"input text '" + text + L"' \"";
+        L" shell input keyboard text " + text;
 
-    output = ExecuteADB(command, 15000);
+    output = ExecuteADB(arguments, 15000);
 
     if (IsADBError(output) || IsAndroidInputError(output))
     {
         diagnostic =
-            "Both Android text-input forms failed. First: " + firstError +
-            " Second: " + output;
+            "Slow per-character input and bulk input both failed. "
+            "Per-character: " + slowInputError +
+            " Bulk: " + output;
         return false;
     }
 
     diagnostic =
-        "Text injection command completed via quoted Android input text. "
-        "ADB output: " + (output.empty() ? std::string("<empty>") : output);
+        "Text sent using bulk Android keyboard input fallback. "
+        "ADB output: " +
+        (output.empty() ? std::string("<empty>") : output);
     return true;
 }
-
-// ============================================================
-// VERIFY ENTERED NAME AND SURNAME
-// ============================================================
-
 bool VerifyEnteredNamesADB(
     const std::string& deviceId,
     const std::string& firstName,
