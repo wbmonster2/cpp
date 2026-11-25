@@ -47,11 +47,11 @@ static constexpr double PHOTON_MATCH_THRESHOLD = 0.86;
 static constexpr int SCREEN_WIDTH = 960;
 static constexpr int SCREEN_HEIGHT = 540;
 
-static constexpr int LOGIN_TIMEOUT_MS = 22000;
-static constexpr int AFTER_LOGIN_TIMEOUT_MS = 12000;
+static constexpr int LOGIN_TIMEOUT_MS = 15000;
+static constexpr int AFTER_LOGIN_TIMEOUT_MS = 8000;
 
 // Максимальное ожидание появления каждого последующего шаблона.
-static constexpr int STAGE_TIMEOUT_MS = 45000;
+static constexpr int STAGE_TIMEOUT_MS = 30000;
 
 // Интервал между проверками изображения.
 static constexpr int DETECTION_INTERVAL_MS = 120;
@@ -2162,7 +2162,7 @@ bool WaitForInputField(
             consecutiveMatches++;
             center = currentCenter;
 
-            if (consecutiveMatches >= 2)
+            if (consecutiveMatches >= 1)
             {
                 diagnostic = "INPUT FIELD CONFIRMED. " + currentDiagnostic;
                 return true;
@@ -2174,7 +2174,7 @@ bool WaitForInputField(
         }
 
         lastDiagnostic = currentDiagnostic;
-        Sleep(80);
+        Sleep(50);
     }
 
     diagnostic =
@@ -2223,7 +2223,7 @@ bool WaitForPhotonReady(
             consecutive++;
             center = currentCenter;
 
-            if (consecutive >= 2)
+            if (consecutive >= 1)
             {
                 diagnostic =
                     "LOGIN SCREEN CONFIRMED. " +
@@ -2237,7 +2237,7 @@ bool WaitForPhotonReady(
             consecutive = 0;
         }
 
-        Sleep(200);
+        Sleep(100);
     }
 
     diagnostic =
@@ -2275,7 +2275,7 @@ bool WaitForPhotonAfterLogin(
         {
             consecutive++;
 
-            if (consecutive >= 2)
+            if (consecutive >= 1)
             {
                 diagnostic =
                     "AFTER LOGIN SCREEN CONFIRMED. " +
@@ -2289,7 +2289,7 @@ bool WaitForPhotonAfterLogin(
             consecutive = 0;
         }
 
-        Sleep(250);
+        Sleep(120);
     }
 
     diagnostic =
@@ -2340,7 +2340,7 @@ bool WaitForStage(
             consecutive++;
             center = currentCenter;
 
-            if (consecutive >= 2)
+            if (consecutive >= 1)
             {
                 diagnostic =
                     templateName +
@@ -3051,7 +3051,7 @@ AutomationResult RunPhotonAutomation(
         "enter_name",
         firstNameCenter,
         nameDiagnostic,
-        25000))
+        18000))
     {
         log << "FIRST NAME FIELD NOT FOUND: " << nameDiagnostic << "\n";
         return result;
@@ -3113,7 +3113,7 @@ AutomationResult RunPhotonAutomation(
         "enter_lastname",
         lastNameCenter,
         surnameDiagnostic,
-        25000))
+        18000))
     {
         log << "LAST NAME FIELD NOT FOUND: " << surnameDiagnostic << "\n";
         return result;
