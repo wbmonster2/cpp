@@ -915,25 +915,82 @@ bool InputADBText(
 
     const std::wstring text = Utf8ToWide(value);
 
-    // KEYEVENTF_UNICODE makes Windows deliver real keyboard character
-    // events to the focused LDPlayer render window, one character at a time.
+    // Use keyboard scan codes, not clipboard paste or ADB text injection.
+    // These are ordinary key-down/key-up events delivered to LDPlayer.
     for (wchar_t ch : text)
     {
-        INPUT events[2]{};
+        const SHORT keyMapping = VkKeyScanW(ch);
 
-        events[0].type = INPUT_KEYBOARD;
-        events[0].ki.wScan = ch;
-        events[0].ki.dwFlags = KEYEVENTF_UNICODE;
-
-        events[1].type = INPUT_KEYBOARD;
-        events[1].ki.wScan = ch;
-        events[1].ki.dwFlags =
-            KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
-
-        if (SendInput(2, events, sizeof(INPUT)) != 2)
+        if (keyMapping == -1)
         {
             diagnostic =
-                "Unicode keyboard input failed. Win32 error: " +
+                "The current Windows keyboard layout cannot map character: " +
+                std::to_string(static_cast<unsigned int>(ch));
+            return false;
+        }
+
+        const WORD virtualKey = LOBYTE(keyMapping);
+        const BYTE modifiers = HIBYTE(keyMapping);
+
+        std::vector<INPUT> events;
+
+        auto appendScanCode = [&events](WORD vk, bool keyUp)
+        {
+            UINT scanCode = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+
+            INPUT event{};
+            event.type = INPUT_KEYBOARD;
+            event.ki.wVk = 0;
+            event.ki.wScan = static_cast<WORD>(scanCode & 0xFF);
+            event.ki.dwFlags = KEYEVENTF_SCANCODE;
+
+            if ((scanCode & 0xFF00) != 0)
+                event.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+
+            if (keyUp)
+                event.ki.dwFlags |= KEYEVENTF_KEYUP;
+
+            events.push_back(event);
+        };
+
+        bool needShift = (modifiers & 1) != 0;
+        const bool needControl = (modifiers & 2) != 0;
+        const bool needAlt = (modifiers & 4) != 0;
+
+        // Respect the current Caps Lock state for alphabetic characters.
+        if ((virtualKey >= 'A' && virtualKey <= 'Z') &&
+            (GetKeyState(VK_CAPITAL) & 1))
+        {
+            needShift = !needShift;
+        }
+
+        if (needControl)
+            appendScanCode(VK_CONTROL, false);
+        if (needAlt)
+            appendScanCode(VK_MENU, false);
+        if (needShift)
+            appendScanCode(VK_SHIFT, false);
+
+        appendScanCode(virtualKey, false);
+        appendScanCode(virtualKey, true);
+
+        if (needShift)
+            appendScanCode(VK_SHIFT, true);
+        if (needAlt)
+            appendScanCode(VK_MENU, true);
+        if (needControl)
+            appendScanCode(VK_CONTROL, true);
+
+        const UINT sent = SendInput(
+            static_cast<UINT>(events.size()),
+            events.data(),
+            sizeof(INPUT)
+        );
+
+        if (sent != events.size())
+        {
+            diagnostic =
+                "Physical-style scan-code input failed. Win32 error: " +
                 std::to_string(GetLastError());
             return false;
         }
@@ -942,9 +999,9 @@ bool InputADBText(
     }
 
     diagnostic =
-        "REAL WINDOWS KEYBOARD: typed " +
+        "REAL WINDOWS KEYBOARD: sent " +
         std::to_string(text.size()) +
-        " characters through SendInput.";
+        " scan-code key presses through SendInput.";
 
     return true;
 }
