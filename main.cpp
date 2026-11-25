@@ -23,6 +23,7 @@
 #include <cmath>
 #include <map>
 #include <array>
+#include <unordered_set>
 
 #include "imgui.h"
 #include "imgui_impl_win32.h"
@@ -2058,101 +2059,295 @@ bool WaitAndTapStage(
 // RANDOM ROLEPLAY NAMES
 // ============================================================
 
+// Load all previously generated logins from the Desktop history file.
+// This makes uniqueness persistent between SmartClick launches.
+bool LoadUsedRoleplayNames(
+    std::unordered_set<std::string>& usedFullNames,
+    std::unordered_set<std::string>& usedFirstNames,
+    std::unordered_set<std::string>& usedLastNames,
+    std::string& diagnostic)
+{
+    wchar_t desktopPath[MAX_PATH]{};
+
+    HRESULT result = SHGetFolderPathW(
+        nullptr,
+        CSIDL_DESKTOPDIRECTORY,
+        nullptr,
+        SHGFP_TYPE_CURRENT,
+        desktopPath
+    );
+
+    if (FAILED(result))
+    {
+        diagnostic = "Cannot locate Windows Desktop for unique-name history.";
+        return false;
+    }
+
+    const std::wstring filePath =
+        std::wstring(desktopPath) + L"\\SmartClick_Names.txt";
+
+    HANDLE file = CreateFileW(
+        filePath.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+    );
+
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        if (GetLastError() == ERROR_FILE_NOT_FOUND ||
+            GetLastError() == ERROR_PATH_NOT_FOUND)
+        {
+            diagnostic = "No previous name history; starting a new unique-name list.";
+            return true;
+        }
+
+        diagnostic =
+            "Cannot read SmartClick_Names.txt. Win32 error: " +
+            std::to_string(GetLastError());
+        return false;
+    }
+
+    LARGE_INTEGER fileSize{};
+    if (!GetFileSizeEx(file, &fileSize) ||
+        fileSize.QuadPart < 0 ||
+        fileSize.QuadPart > 20 * 1024 * 1024)
+    {
+        CloseHandle(file);
+        diagnostic = "Name history file size is invalid.";
+        return false;
+    }
+
+    std::string contents(static_cast<size_t>(fileSize.QuadPart), '\\0');
+    size_t totalRead = 0;
+
+    while (totalRead < contents.size())
+    {
+        DWORD bytesRead = 0;
+        const DWORD request = static_cast<DWORD>(
+            std::min<size_t>(contents.size() - totalRead, 1024 * 1024)
+        );
+
+        if (!ReadFile(
+            file,
+            contents.data() + totalRead,
+            request,
+            &bytesRead,
+            nullptr) || bytesRead == 0)
+        {
+            CloseHandle(file);
+            diagnostic = "Cannot read complete SmartClick_Names.txt.";
+            return false;
+        }
+
+        totalRead += bytesRead;
+    }
+
+    CloseHandle(file);
+
+    auto normalize = [](std::string value)
+    {
+        std::transform(
+            value.begin(),
+            value.end(),
+            value.begin(),
+            [](unsigned char ch)
+            {
+                return static_cast<char>(std::tolower(ch));
+            }
+        );
+        return value;
+    };
+
+    std::istringstream lines(contents);
+    std::string line;
+
+    while (std::getline(lines, line))
+    {
+        const size_t prefix = line.find("login - \"");
+        if (prefix == std::string::npos)
+            continue;
+
+        const size_t valueStart = prefix + 9;
+        const size_t valueEnd = line.find('"', valueStart);
+
+        if (valueEnd == std::string::npos)
+            continue;
+
+        const std::string login =
+            line.substr(valueStart, valueEnd - valueStart);
+
+        const size_t separator = login.find('_');
+        if (separator == std::string::npos)
+            continue;
+
+        const std::string firstName =
+            normalize(login.substr(0, separator));
+        const std::string lastName =
+            normalize(login.substr(separator + 1));
+
+        if (firstName.empty() || lastName.empty())
+            continue;
+
+        usedFullNames.insert(firstName + "_" + lastName);
+        usedFirstNames.insert(firstName);
+        usedLastNames.insert(lastName);
+    }
+
+    diagnostic =
+        "Loaded " + std::to_string(usedFullNames.size()) +
+        " previously used full names.";
+
+    return true;
+}
+
 std::pair<std::string, std::string> GenerateRoleplayName(
     const std::string& deviceId)
 {
     static const std::vector<std::string> firstNames =
     {
-        "Aleksandr",
-        "Dmitriy",
-        "Mikhail",
-        "Sergey",
-        "Nikolay",
-        "Vladimir",
-        "Andrey",
-        "Artem",
-        "Maksim",
-        "Ivan",
-        "Pavel",
-        "Kirill",
-        "Roman",
-        "Denis",
-        "Egor",
-        "Viktor",
-        "Aleksey",
-        "Konstantin",
-        "Yaroslav",
-        "Timur",
-        "Ilya",
-        "Oleg",
-        "Grigoriy",
-        "Stanislav",
-        "Vyacheslav",
-        "Boris",
-        "Fedor",
-        "Matvey",
-        "Gleb",
-        "Nikita"
+        "Aleksandr", "Dmitriy", "Mikhail", "Sergey", "Nikolay",
+        "Vladimir", "Andrey", "Artem", "Maksim", "Ivan",
+        "Pavel", "Kirill", "Roman", "Denis", "Egor",
+        "Viktor", "Aleksey", "Konstantin", "Yaroslav", "Timur",
+        "Ilya", "Oleg", "Grigoriy", "Stanislav", "Vyacheslav",
+        "Boris", "Fedor", "Matvey", "Gleb", "Nikita",
+        "Anton", "Arseniy", "Danil", "Mark", "Lev",
+        "Miron", "Rodion", "Svyatoslav", "Ruslan", "Vadim",
+        "Vitaliy", "Valeriy", "Georgiy", "Gennadiy", "Leonid",
+        "Anatoliy", "Eduard", "Albert", "German", "Zakhar",
+        "Platon", "Savva", "Tikhon", "Stepan", "Yefim",
+        "Arkadiy", "Arkhip", "Vsevolod", "Prokhor", "Ignat",
+        "Yuriy", "Bulat", "Damir", "Rinat", "Marat",
+        "Albert", "Ostin", "Rostislav", "Timofey", "Gordey",
+        "Evgeniy", "Vasiliy", "Semyon", "Faddey", "Maximilian",
+        "Bogdan", "Vladislav", "Daniil", "Kirill", "Ibrahim",
+        "Robert", "Stanislav", "Felix", "Benedikt", "Yakov"
     };
 
     static const std::vector<std::string> lastNames =
     {
-        "Volkov",
-        "Sokolov",
-        "Morozov",
-        "Lebedev",
-        "Novikov",
-        "Kuznetsov",
-        "Popov",
-        "Smirnov",
-        "Orlov",
-        "Fedorov",
-        "Mikhailov",
-        "Pavlov",
-        "Vinogradov",
-        "Belov",
-        "Tarasov",
-        "Karpov",
-        "Zaitsev",
-        "Gromov",
-        "Baranov",
-        "Romanov",
-        "Kozlov",
-        "Vasiliev",
-        "Petrov",
-        "Semenov",
-        "Nikolaev",
-        "Antonov",
-        "Sidorov",
-        "Medvedev",
-        "Zakharov",
-        "Mironov"
+        "Volkov", "Sokolov", "Morozov", "Lebedev", "Novikov",
+        "Kuznetsov", "Popov", "Smirnov", "Orlov", "Fedorov",
+        "Mikhailov", "Pavlov", "Vinogradov", "Belov", "Tarasov",
+        "Karpov", "Zaitsev", "Gromov", "Baranov", "Romanov",
+        "Kozlov", "Vasiliev", "Petrov", "Semenov", "Nikolaev",
+        "Antonov", "Sidorov", "Medvedev", "Zakharov", "Mironov",
+        "Frolov", "Komarov", "Belyaev", "Gusev", "Makarov",
+        "Andreev", "Borisov", "Grigoriev", "Egorov", "Kiselev",
+        "Kovalev", "Ilyin", "Maximov", "Markov", "Novoselov",
+        "Ponomarev", "Ryabov", "Tikhonov", "Filippov", "Chernov",
+        "Abramov", "Avdeev", "Anisimov", "Bardin", "Barinov",
+        "Bessonov", "Bogdanov", "Bystrov", "Vlasov", "Voronin",
+        "Vorontsov", "Gavrilov", "Golubev", "Doronin", "Dorofeev",
+        "Druzhinin", "Ermakov", "Zhdanov", "Zhukov", "Zhuravlev",
+        "Ignatov", "Isakov", "Kabanov", "Kazakov", "Kalinin",
+        "Kapustin", "Klimov", "Knyazev", "Kondratiev", "Kornilov",
+        "Krylov", "Kudryavtsev", "Kulagin", "Lavrov", "Loginov",
+        "Lukyanov", "Maltsev", "Matveev", "Melnikov", "Mikheev",
+        "Nazarov", "Nikitin", "Nosov", "Ovchinnikov", "Osipov",
+        "Panov", "Pankratov", "Petrushin", "Polyakov", "Prokofiev",
+        "Rogov", "Rogozin", "Safonov", "Savelyev", "Sazonov",
+        "Shapovalov", "Shestakov", "Shubin", "Sitnikov", "Sobolev",
+        "Soloviev", "Suvorov", "Trofimov", "Uvarov", "Fadeev",
+        "Fedoseev", "Fetisov", "Kharitonov", "Kholodov", "Shcherbakov"
     };
+
+    // Protect the history read and candidate reservation from any parallel callers.
+    std::lock_guard<std::mutex> historyLock(g_NamesFileMutex);
+
+    std::unordered_set<std::string> usedFullNames;
+    std::unordered_set<std::string> usedFirstNames;
+    std::unordered_set<std::string> usedLastNames;
+    std::string historyDiagnostic;
+
+    if (!LoadUsedRoleplayNames(
+        usedFullNames,
+        usedFirstNames,
+        usedLastNames,
+        historyDiagnostic))
+    {
+        return {};
+    }
+
+    std::random_device randomDevice;
+    const auto timeSeed =
+        static_cast<unsigned long long>(
+            std::chrono::high_resolution_clock::now()
+                .time_since_epoch().count()
+        );
 
     std::seed_seq seed
     {
-        static_cast<unsigned int>(GetTickCount()),
+        randomDevice(), randomDevice(), randomDevice(), randomDevice(),
+        static_cast<unsigned int>(GetTickCount64()),
+        static_cast<unsigned int>(timeSeed),
+        static_cast<unsigned int>(timeSeed >> 32),
         static_cast<unsigned int>(
-            std::hash<std::string>{}(deviceId)),
-        static_cast<unsigned int>(
-            std::chrono::high_resolution_clock::now()
-                .time_since_epoch().count())
+            std::hash<std::string>{}(deviceId))
     };
 
-    std::mt19937 generator(seed);
+    std::mt19937_64 generator(seed);
 
-    std::uniform_int_distribution<size_t> firstDistribution(
-        0, firstNames.size() - 1
-    );
+    using NameIndexes = std::pair<size_t, size_t>;
+    std::vector<NameIndexes> neverUsedParts;
+    std::vector<NameIndexes> uniqueFullNames;
 
-    std::uniform_int_distribution<size_t> lastDistribution(
-        0, lastNames.size() - 1
-    );
+    for (size_t firstIndex = 0;
+        firstIndex < firstNames.size();
+        ++firstIndex)
+    {
+        std::string firstKey = firstNames[firstIndex];
+        std::transform(
+            firstKey.begin(), firstKey.end(), firstKey.begin(),
+            [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); }
+        );
+
+        for (size_t lastIndex = 0;
+            lastIndex < lastNames.size();
+            ++lastIndex)
+        {
+            std::string lastKey = lastNames[lastIndex];
+            std::transform(
+                lastKey.begin(), lastKey.end(), lastKey.begin(),
+                [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); }
+            );
+
+            const std::string fullKey = firstKey + "_" + lastKey;
+
+            if (usedFullNames.find(fullKey) != usedFullNames.end())
+                continue;
+
+            uniqueFullNames.emplace_back(firstIndex, lastIndex);
+
+            if (usedFirstNames.find(firstKey) == usedFirstNames.end() &&
+                usedLastNames.find(lastKey) == usedLastNames.end())
+            {
+                neverUsedParts.emplace_back(firstIndex, lastIndex);
+            }
+        }
+    }
+
+    // First prefer a never-before-used first name AND surname.
+    // Once those pools have been individually consumed, continue with
+    // randomly chosen combinations whose full login has never appeared.
+    std::vector<NameIndexes>& candidates =
+        neverUsedParts.empty() ? uniqueFullNames : neverUsedParts;
+
+    if (candidates.empty())
+        return {};
+
+    std::shuffle(candidates.begin(), candidates.end(), generator);
+
+    const NameIndexes selected = candidates.front();
 
     return
     {
-        firstNames[firstDistribution(generator)],
-        lastNames[lastDistribution(generator)]
+        firstNames[selected.first],
+        lastNames[selected.second]
     };
 }
 
@@ -2355,7 +2550,16 @@ AutomationResult RunPhotonAutomation(
     const std::string firstName = generatedName.first;
     const std::string lastName = generatedName.second;
 
-    log << "\nGENERATED FIRST NAME: " << firstName << "\n";
+    if (firstName.empty() || lastName.empty())
+    {
+        log
+            << "ERROR: Could not create a new unique name/surname pair. "
+            << "Check SmartClick_Names.txt on the Desktop; "
+            << "the history may be inaccessible or the candidate pool exhausted.\n";
+        return result;
+    }
+
+    log << "\nGENERATED UNIQUE FIRST NAME: " << firstName << "\n";
     log << "CLICKING FIRST-NAME FIELD AT ("
         << firstNameCenter.x << ", " << firstNameCenter.y << ")\n";
 
@@ -2467,10 +2671,24 @@ AutomationResult RunPhotonAutomation(
     }
 
     // --------------------------------------------------------
-    // STEP 7: WAIT FOR PASSWORD FIELD
+    // STEP 7: CLICK PLAY AFTER ENTERING THE NEW NAME
     // --------------------------------------------------------
 
-    log << "\n[7] WAIT FOR PASSWORD FIELD\n";
+    log << "\n[7] WAIT FOR PLAY / ИГРАТЬ BUTTON\n";
+
+    if (!WaitAndTapStage(device.id, "play", log))
+    {
+        log << "FAILED: could not detect/click the Play button after name entry.\n";
+        return result;
+    }
+
+    Sleep(900);
+
+    // --------------------------------------------------------
+    // STEP 8: WAIT FOR PASSWORD FIELD
+    // --------------------------------------------------------
+
+    log << "\n[8] WAIT FOR PASSWORD FIELD\n";
 
     POINT passwordCenter{};
     std::string passwordDiagnostic;
@@ -2513,10 +2731,10 @@ AutomationResult RunPhotonAutomation(
     log << "Password input command sent.\n";
 
     // --------------------------------------------------------
-    // STEP 8: WAIT FOR PASSWORD REPEAT FIELD
+    // STEP 9: WAIT FOR PASSWORD REPEAT FIELD
     // --------------------------------------------------------
 
-    log << "\n[8] WAIT FOR PASSWORD REPEAT FIELD\n";
+    log << "\n[9] WAIT FOR PASSWORD REPEAT FIELD\n";
 
     POINT repeatCenter{};
     std::string repeatDiagnostic;
@@ -2559,10 +2777,10 @@ AutomationResult RunPhotonAutomation(
     log << "Repeated password input command sent.\n";
 
     // --------------------------------------------------------
-    // STEP 9: REGISTER
+    // STEP 10: REGISTER
     // --------------------------------------------------------
 
-    log << "\n[9] WAIT FOR REGISTER BUTTON\n";
+    log << "\n[10] WAIT FOR REGISTER BUTTON\n";
 
     if (!WaitAndTapStage(device.id, "register", log))
         return result;
@@ -2570,28 +2788,28 @@ AutomationResult RunPhotonAutomation(
     result.registrationCompleted = true;
 
     // --------------------------------------------------------
-    // STEP 10: SKIP
+    // STEP 11: SKIP
     // --------------------------------------------------------
 
-    log << "\n[10] WAIT FOR SKIP BUTTON\n";
+    log << "\n[11] WAIT FOR SKIP BUTTON\n";
 
     if (!WaitAndTapStage(device.id, "skip", log))
         return result;
 
     // --------------------------------------------------------
-    // STEP 11: NEXT
+    // STEP 12: NEXT
     // --------------------------------------------------------
 
-    log << "\n[11] WAIT FOR NEXT BUTTON\n";
+    log << "\n[12] WAIT FOR NEXT BUTTON\n";
 
     if (!WaitAndTapStage(device.id, "next", log))
         return result;
 
     // --------------------------------------------------------
-    // STEP 12: START
+    // STEP 13: START
     // --------------------------------------------------------
 
-    log << "\n[12] WAIT FOR START BUTTON\n";
+    log << "\n[13] WAIT FOR START BUTTON\n";
 
     if (!WaitAndTapStage(device.id, "start", log))
         return result;
