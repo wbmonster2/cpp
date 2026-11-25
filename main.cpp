@@ -784,6 +784,154 @@ bool SendVirtualKey(WORD virtualKey, std::string& diagnostic)
     return true;
 }
 
+// Dedicated login-button click. The login screen can be more sensitive to
+// focus transitions than later in-game controls, so it has two real mouse paths.
+bool TapLoginButton(
+    const std::string& deviceId,
+    int x,
+    int y,
+    int attempt,
+    std::string& diagnostic)
+{
+    if (x < 0 || x >= SCREEN_WIDTH ||
+        y < 0 || y >= SCREEN_HEIGHT)
+    {
+        diagnostic = "Login button coordinates are outside the game screen.";
+        return false;
+    }
+
+    HWND topLevelWindow = nullptr;
+    HWND renderWindow = nullptr;
+
+    if (!ActivateEmulatorWindow(
+        deviceId,
+        topLevelWindow,
+        renderWindow,
+        diagnostic))
+    {
+        diagnostic = "Login focus failed: " + diagnostic;
+        return false;
+    }
+
+    POINT screenPoint{};
+    if (!GetScreenPointForEmulator(
+        renderWindow,
+        x,
+        y,
+        screenPoint,
+        diagnostic))
+    {
+        diagnostic = "Login coordinate conversion failed: " + diagnostic;
+        return false;
+    }
+
+    if (!SetCursorPos(screenPoint.x, screenPoint.y))
+    {
+        diagnostic =
+            "Login cursor positioning failed. Win32 error: " +
+            std::to_string(GetLastError());
+        return false;
+    }
+
+    Sleep(35);
+
+    HWND pointWindow = WindowFromPoint(screenPoint);
+    HWND pointRoot = pointWindow
+        ? GetAncestor(pointWindow, GA_ROOT)
+        : nullptr;
+    HWND pointRootOwner = pointWindow
+        ? GetAncestor(pointWindow, GA_ROOTOWNER)
+        : nullptr;
+
+    if (pointRoot != topLevelWindow &&
+        pointRootOwner != topLevelWindow &&
+        pointWindow != topLevelWindow)
+    {
+        diagnostic =
+            "Login click cancelled: another window covers the login button. "
+            "Move the emulator windows so the login button is visible.";
+        return false;
+    }
+
+    if (attempt <= 1)
+    {
+        // Primary path: a normal SendInput down/up with a longer hold.
+        INPUT move{};
+        move.type = INPUT_MOUSE;
+        move.mi.dx = static_cast<LONG>(
+            (static_cast<long long>(
+                screenPoint.x - GetSystemMetrics(SM_XVIRTUALSCREEN)) * 65535) /
+            std::max(1, GetSystemMetrics(SM_CXVIRTUALSCREEN) - 1)
+        );
+        move.mi.dy = static_cast<LONG>(
+            (static_cast<long long>(
+                screenPoint.y - GetSystemMetrics(SM_YVIRTUALSCREEN)) * 65535) /
+            std::max(1, GetSystemMetrics(SM_CYVIRTUALSCREEN) - 1)
+        );
+        move.mi.dwFlags =
+            MOUSEEVENTF_MOVE |
+            MOUSEEVENTF_ABSOLUTE |
+            MOUSEEVENTF_VIRTUALDESK;
+
+        if (SendInput(1, &move, sizeof(INPUT)) != 1)
+        {
+            diagnostic =
+                "Login SendInput mouse move failed. Win32 error: " +
+                std::to_string(GetLastError());
+            return false;
+        }
+
+        INPUT down{};
+        down.type = INPUT_MOUSE;
+        down.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+
+        INPUT up{};
+        up.type = INPUT_MOUSE;
+        up.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+
+        if (SendInput(1, &down, sizeof(INPUT)) != 1)
+        {
+            diagnostic =
+                "Login SendInput left-down failed. Win32 error: " +
+                std::to_string(GetLastError());
+            return false;
+        }
+
+        Sleep(85);
+
+        if (SendInput(1, &up, sizeof(INPUT)) != 1)
+        {
+            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+            diagnostic =
+                "Login SendInput left-up failed. Win32 error: " +
+                std::to_string(GetLastError());
+            return false;
+        }
+
+        diagnostic =
+            "LOGIN CLICK: primary SendInput mouse press, 85 ms hold, "
+            "game=(" + std::to_string(x) + "," + std::to_string(y) +
+            "), desktop=(" + std::to_string(screenPoint.x) + "," +
+            std::to_string(screenPoint.y) + ").";
+        return true;
+    }
+
+    // Fallback path: the legacy Win32 mouse_event API, not ADB or a
+    // window-message simulation. It produces a separate desktop mouse click.
+    mouse_event(MOUSEEVENTF_MOVE, 0, 0, 0, 0);
+    mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+    Sleep(95);
+    mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+
+    diagnostic =
+        "LOGIN CLICK: fallback Win32 mouse_event press, 95 ms hold, "
+        "game=(" + std::to_string(x) + "," + std::to_string(y) +
+        "), desktop=(" + std::to_string(screenPoint.x) + "," +
+        std::to_string(screenPoint.y) + ").";
+
+    return true;
+}
+
 bool TapADB(
     const std::string& deviceId,
     int x,
@@ -2337,51 +2485,56 @@ std::pair<std::string, std::string> GenerateRoleplayName(
 {
     static const std::vector<std::string> firstNames =
     {
-        "Aleksandr", "Dmitriy", "Mikhail", "Sergey", "Nikolay",
-        "Vladimir", "Andrey", "Artem", "Maksim", "Ivan",
-        "Pavel", "Kirill", "Roman", "Denis", "Egor",
-        "Viktor", "Aleksey", "Konstantin", "Yaroslav", "Timur",
-        "Ilya", "Oleg", "Grigoriy", "Stanislav", "Vyacheslav",
-        "Boris", "Fedor", "Matvey", "Gleb", "Nikita",
-        "Anton", "Arseniy", "Danil", "Mark", "Lev",
-        "Miron", "Rodion", "Svyatoslav", "Ruslan", "Vadim",
-        "Vitaliy", "Valeriy", "Georgiy", "Gennadiy", "Leonid",
-        "Anatoliy", "Eduard", "Albert", "German", "Zakhar",
-        "Platon", "Savva", "Tikhon", "Stepan", "Yefim",
-        "Arkadiy", "Arkhip", "Vsevolod", "Prokhor", "Ignat",
-        "Yuriy", "Bulat", "Damir", "Rinat", "Marat",
-        "Albert", "Ostin", "Rostislav", "Timofey", "Gordey",
-        "Evgeniy", "Vasiliy", "Semyon", "Faddey", "Maximilian",
-        "Bogdan", "Vladislav", "Daniil", "Kirill", "Ibrahim",
-        "Robert", "Stanislav", "Felix", "Benedikt", "Yakov"
+        "James", "John", "Robert", "Michael", "William", "David",
+        "Richard", "Joseph", "Thomas", "Charles", "Christopher", "Daniel",
+        "Matthew", "Anthony", "Mark", "Donald", "Steven", "Paul",
+        "Andrew", "Joshua", "Kenneth", "Kevin", "Brian", "George",
+        "Timothy", "Ronald", "Edward", "Jason", "Jeffrey", "Ryan",
+        "Jacob", "Gary", "Nicholas", "Eric", "Jonathan", "Stephen",
+        "Larry", "Justin", "Scott", "Brandon", "Benjamin", "Samuel",
+        "Gregory", "Alexander", "Patrick", "Frank", "Raymond", "Jack",
+        "Dennis", "Jerry", "Tyler", "Aaron", "Adam", "Nathan",
+        "Henry", "Zachary", "Douglas", "Peter", "Kyle", "Walter",
+        "Ethan", "Jeremy", "Keith", "Christian", "Roger", "Noah",
+        "Gerald", "Carl", "Sean", "Austin", "Arthur", "Lawrence",
+        "Jesse", "Dylan", "Bryan", "Jordan", "Bruce", "Albert",
+        "Gabriel", "Logan", "Alan", "Wayne", "Vincent", "Russell",
+        "Elijah", "Louis", "Philip", "Bradley", "Cameron", "Connor",
+        "Evan", "Hunter", "Liam", "Mason", "Caleb", "Owen",
+        "Wyatt", "Luke", "Isaac", "Julian", "Grayson", "Levi",
+        "Aiden", "Miles", "Eli", "Theo", "Nolan", "Colton",
+        "Emma", "Olivia", "Ava", "Sophia", "Isabella", "Mia",
+        "Charlotte", "Amelia", "Harper", "Evelyn", "Abigail", "Emily",
+        "Elizabeth", "Sofia", "Avery", "Ella", "Scarlett", "Grace",
+        "Chloe", "Victoria", "Riley", "Aria", "Lily", "Zoey",
+        "Nora", "Hannah", "Layla", "Addison", "Ellie", "Stella",
+        "Natalie", "Claire", "Audrey", "Brooklyn", "Savannah", "Lucy"
     };
 
     static const std::vector<std::string> lastNames =
     {
-        "Volkov", "Sokolov", "Morozov", "Lebedev", "Novikov",
-        "Kuznetsov", "Popov", "Smirnov", "Orlov", "Fedorov",
-        "Mikhailov", "Pavlov", "Vinogradov", "Belov", "Tarasov",
-        "Karpov", "Zaitsev", "Gromov", "Baranov", "Romanov",
-        "Kozlov", "Vasiliev", "Petrov", "Semenov", "Nikolaev",
-        "Antonov", "Sidorov", "Medvedev", "Zakharov", "Mironov",
-        "Frolov", "Komarov", "Belyaev", "Gusev", "Makarov",
-        "Andreev", "Borisov", "Grigoriev", "Egorov", "Kiselev",
-        "Kovalev", "Ilyin", "Maximov", "Markov", "Novoselov",
-        "Ponomarev", "Ryabov", "Tikhonov", "Filippov", "Chernov",
-        "Abramov", "Avdeev", "Anisimov", "Bardin", "Barinov",
-        "Bessonov", "Bogdanov", "Bystrov", "Vlasov", "Voronin",
-        "Vorontsov", "Gavrilov", "Golubev", "Doronin", "Dorofeev",
-        "Druzhinin", "Ermakov", "Zhdanov", "Zhukov", "Zhuravlev",
-        "Ignatov", "Isakov", "Kabanov", "Kazakov", "Kalinin",
-        "Kapustin", "Klimov", "Knyazev", "Kondratiev", "Kornilov",
-        "Krylov", "Kudryavtsev", "Kulagin", "Lavrov", "Loginov",
-        "Lukyanov", "Maltsev", "Matveev", "Melnikov", "Mikheev",
-        "Nazarov", "Nikitin", "Nosov", "Ovchinnikov", "Osipov",
-        "Panov", "Pankratov", "Petrushin", "Polyakov", "Prokofiev",
-        "Rogov", "Rogozin", "Safonov", "Savelyev", "Sazonov",
-        "Shapovalov", "Shestakov", "Shubin", "Sitnikov", "Sobolev",
-        "Soloviev", "Suvorov", "Trofimov", "Uvarov", "Fadeev",
-        "Fedoseev", "Fetisov", "Kharitonov", "Kholodov", "Shcherbakov"
+        "Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia",
+        "Miller", "Davis", "Rodriguez", "Martinez", "Hernandez", "Lopez",
+        "Gonzalez", "Wilson", "Anderson", "Thomas", "Taylor", "Moore",
+        "Jackson", "Martin", "Lee", "Perez", "Thompson", "White",
+        "Harris", "Sanchez", "Clark", "Ramirez", "Lewis", "Robinson",
+        "Walker", "Young", "Allen", "King", "Wright", "Scott",
+        "Torres", "Nguyen", "Hill", "Flores", "Green", "Adams",
+        "Nelson", "Baker", "Hall", "Rivera", "Campbell", "Mitchell",
+        "Carter", "Roberts", "Gomez", "Phillips", "Evans", "Turner",
+        "Diaz", "Parker", "Cruz", "Edwards", "Collins", "Reyes",
+        "Stewart", "Morris", "Morales", "Murphy", "Cook", "Rogers",
+        "Gutierrez", "Ortiz", "Morgan", "Cooper", "Peterson", "Bailey",
+        "Reed", "Kelly", "Howard", "Ramos", "Kim", "Cox",
+        "Ward", "Richardson", "Watson", "Brooks", "Chavez", "Wood",
+        "Bennett", "Gray", "Mendoza", "Ruiz", "Hughes", "Price",
+        "Alvarez", "Castillo", "Sanders", "Myers", "Long", "Ross",
+        "Foster", "Jimenez", "Powell", "Jenkins", "Perry", "Russell",
+        "Sullivan", "Bell", "Coleman", "Butler", "Henderson", "Barnes",
+        "Fisher", "Simmons", "Patterson", "Alexander", "Hamilton", "Graham",
+        "Reynolds", "Griffin", "Wallace", "West", "Cole", "Hayes",
+        "Bryant", "Herrera", "Gibson", "Ellis", "Tran", "Medina",
+        "Aguilar", "Stevens", "Murray", "Ford", "Castro", "Marshall"
     };
 
     // Remove accidental duplicate entries from source lists before constructing
@@ -2453,6 +2606,94 @@ std::pair<std::string, std::string> GenerateRoleplayName(
 
     std::mt19937_64 generator(seed);
 
+    // Add pronounceable fictional American-style names. These are generated
+    // from random syllable combinations and filtered against the saved history.
+    const std::vector<std::string> firstStarts =
+    {
+        "Aver", "Bray", "Cal", "Cor", "Daven", "Eli", "Fay",
+        "Garr", "Harlan", "Jor", "Kellan", "Lenn", "Mav", "Norr",
+        "Orin", "Perr", "Quin", "Renn", "Soren", "Tav", "Vey",
+        "Wyn", "Zay", "Bex", "Cade", "Dax", "Evren", "Fenn",
+        "Jalen", "Kael", "Lior", "Merr", "Nyle", "Orren", "Rylan",
+        "Taren", "Varen", "Wells", "Zev"
+    };
+
+    const std::vector<std::string> firstEnds =
+    {
+        "den", "ley", "ton", "son", "win", "len", "rick",
+        "vin", "lan", "mon", "ran", "ford", "las", "ian",
+        "ett", "an", "el", "is", "en", "er", "ar", "on",
+        "ric", "well", "wyn", "ley", "bert", "lin", "ric",
+        "more", "den", "ley", "wyn", "ace", "ory", "ett"
+    };
+
+    const std::vector<std::string> surnameStarts =
+    {
+        "Ash", "Black", "Brook", "Cald", "Cedar", "Clear", "Dun",
+        "Ever", "Fair", "Fox", "Grey", "Hart", "Hollow", "Kings",
+        "Lake", "Marl", "North", "Oak", "Pine", "Raven", "Silver",
+        "Stone", "West", "White", "Willow", "Winter", "Wood",
+        "Amber", "Arden", "Briar", "Crest", "Dover", "Elm",
+        "Glen", "Haven", "Iron", "Laurel", "Meadow", "Ridge"
+    };
+
+    const std::vector<std::string> surnameEnds =
+    {
+        "brook", "field", "ford", "gate", "ham", "hill", "land",
+        "ley", "more", "ridge", "stone", "vale", "well", "wood",
+        "worth", "man", "ton", "son", "er", "by", "croft",
+        "haven", "hurst", "mont", "wick", "shaw", "dale", "burn"
+    };
+
+    std::uniform_int_distribution<size_t> firstStartPick(
+        0, firstStarts.size() - 1
+    );
+    std::uniform_int_distribution<size_t> firstEndPick(
+        0, firstEnds.size() - 1
+    );
+    std::uniform_int_distribution<size_t> surnameStartPick(
+        0, surnameStarts.size() - 1
+    );
+    std::uniform_int_distribution<size_t> surnameEndPick(
+        0, surnameEnds.size() - 1
+    );
+
+    // The base lists are preferred, but fictional candidates are mixed in
+    // randomly so the generated account names do not look like a fixed list.
+    for (int attempt = 0;
+        attempt < 1200 && uniqueFirstNames.size() < firstNames.size() + 500;
+        ++attempt)
+    {
+        const std::string candidate =
+            firstStarts[firstStartPick(generator)] +
+            firstEnds[firstEndPick(generator)];
+
+        const std::string key = normalizeName(candidate);
+
+        if (usedFirstNames.find(key) == usedFirstNames.end() &&
+            seenFirstNames.insert(key).second)
+        {
+            uniqueFirstNames.push_back(candidate);
+        }
+    }
+
+    for (int attempt = 0;
+        attempt < 1200 && uniqueLastNames.size() < lastNames.size() + 500;
+        ++attempt)
+    {
+        const std::string candidate =
+            surnameStarts[surnameStartPick(generator)] +
+            surnameEnds[surnameEndPick(generator)];
+
+        const std::string key = normalizeName(candidate);
+
+        if (usedLastNames.find(key) == usedLastNames.end() &&
+            seenLastNames.insert(key).second)
+        {
+            uniqueLastNames.push_back(candidate);
+        }
+    }
+
     using NameIndexes = std::pair<size_t, size_t>;
     std::vector<NameIndexes> neverUsedParts;
     std::vector<NameIndexes> uniqueFullNames;
@@ -2461,49 +2702,72 @@ std::pair<std::string, std::string> GenerateRoleplayName(
         firstIndex < uniqueFirstNames.size();
         ++firstIndex)
     {
-        std::string firstKey = uniqueFirstNames[firstIndex];
-        std::transform(
-            firstKey.begin(), firstKey.end(), firstKey.begin(),
-            [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); }
-        );
+        const std::string firstKey =
+            normalizeName(uniqueFirstNames[firstIndex]);
+
+        if (usedFirstNames.find(firstKey) != usedFirstNames.end())
+            continue;
 
         for (size_t lastIndex = 0;
             lastIndex < uniqueLastNames.size();
             ++lastIndex)
         {
-            std::string lastKey = uniqueLastNames[lastIndex];
-            std::transform(
-                lastKey.begin(), lastKey.end(), lastKey.begin(),
-                [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); }
-            );
+            const std::string lastKey =
+                normalizeName(uniqueLastNames[lastIndex]);
+
+            if (usedLastNames.find(lastKey) != usedLastNames.end())
+                continue;
 
             const std::string fullKey = firstKey + "_" + lastKey;
 
             if (usedFullNames.find(fullKey) != usedFullNames.end())
                 continue;
 
-            uniqueFullNames.emplace_back(firstIndex, lastIndex);
+            neverUsedParts.emplace_back(firstIndex, lastIndex);
+        }
+    }
 
-            if (usedFirstNames.find(firstKey) == usedFirstNames.end() &&
-                usedLastNames.find(lastKey) == usedLastNames.end())
+    // The generated values must both be new, not merely a new combination.
+    // Fictional syllable combinations provide a much larger fresh-name pool.
+    if (neverUsedParts.empty())
+    {
+        for (size_t firstIndex = 0;
+            firstIndex < uniqueFirstNames.size();
+            ++firstIndex)
+        {
+            const std::string firstKey =
+                normalizeName(uniqueFirstNames[firstIndex]);
+
+            if (usedFirstNames.find(firstKey) != usedFirstNames.end())
+                continue;
+
+            for (size_t lastIndex = 0;
+                lastIndex < uniqueLastNames.size();
+                ++lastIndex)
             {
-                neverUsedParts.emplace_back(firstIndex, lastIndex);
+                const std::string lastKey =
+                    normalizeName(uniqueLastNames[lastIndex]);
+
+                const std::string fullKey = firstKey + "_" + lastKey;
+
+                if (usedFullNames.find(fullKey) == usedFullNames.end())
+                    uniqueFullNames.emplace_back(firstIndex, lastIndex);
             }
         }
     }
 
-    // First prefer a never-before-used first name AND surname.
-    // Once those pools have been individually consumed, continue with
-    // randomly chosen combinations whose full login has never appeared.
     std::vector<NameIndexes>& candidates =
         neverUsedParts.empty() ? uniqueFullNames : neverUsedParts;
 
     if (candidates.empty())
         return {};
 
-    std::shuffle(candidates.begin(), candidates.end(), generator);
+    std::uniform_int_distribution<size_t> candidatePick(
+        0, candidates.size() - 1
+    );
 
-    const NameIndexes selected = candidates.front();
+    const NameIndexes selected =
+        candidates[candidatePick(generator)];
 
     return
     {
@@ -2618,14 +2882,15 @@ AutomationResult RunPhotonAutomation(
     {
         log
             << "Login attempt "
-            << attempt << "/2 using REAL WINDOWS MOUSE input\n";
+            << attempt << "/2 using dedicated login-button mouse method\n";
 
         std::string tapDiagnostic;
 
-        if (!TapADB(
+        if (!TapLoginButton(
             device.id,
             loginCenter.x,
             loginCenter.y,
+            attempt,
             tapDiagnostic))
         {
             log << "ERROR: " << tapDiagnostic << "\n";
@@ -2641,7 +2906,7 @@ AutomationResult RunPhotonAutomation(
             device.id,
             afterConfidence,
             afterDiagnostic,
-            AFTER_LOGIN_TIMEOUT_MS
+            10000
         );
 
         log << afterDiagnostic << "\n";
