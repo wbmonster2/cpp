@@ -20,6 +20,7 @@
 #include <chrono>
 #include <random>
 #include <cctype>
+#include <cmath>
 #include <map>
 #include <array>
 
