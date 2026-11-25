@@ -47,17 +47,17 @@ static constexpr double PHOTON_MATCH_THRESHOLD = 0.86;
 static constexpr int SCREEN_WIDTH = 960;
 static constexpr int SCREEN_HEIGHT = 540;
 
-static constexpr int LOGIN_TIMEOUT_MS = 35000;
-static constexpr int AFTER_LOGIN_TIMEOUT_MS = 45000;
+static constexpr int LOGIN_TIMEOUT_MS = 22000;
+static constexpr int AFTER_LOGIN_TIMEOUT_MS = 12000;
 
 // Максимальное ожидание появления каждого последующего шаблона.
-static constexpr int STAGE_TIMEOUT_MS = 300000;
+static constexpr int STAGE_TIMEOUT_MS = 45000;
 
 // Интервал между проверками изображения.
-static constexpr int DETECTION_INTERVAL_MS = 250;
+static constexpr int DETECTION_INTERVAL_MS = 120;
 
 // Пауза перед первым действием.
-static constexpr int INITIAL_DELAY_MS = 1200;
+static constexpr int INITIAL_DELAY_MS = 350;
 
 // ============================================================
 // GLOBAL STATE
@@ -1164,19 +1164,101 @@ bool ClearADBTextField(
         return false;
     }
 
-    Sleep(80);
+    // Do not call ActivateEmulatorWindow again here: the click has just
+    // focused the actual input widget. Re-activating the render HWND could
+    // steal focus from a WebView/game text field on secondary emulators.
+    Sleep(25);
 
-    std::string backspaceDiagnostic;
-    if (!SendBackspaceADB(deviceId, 20, backspaceDiagnostic))
+    std::vector<INPUT> selectAllEvents;
+
+    auto appendVk = [](std::vector<INPUT>& events, WORD key, bool keyUp)
     {
+        INPUT event{};
+        event.type = INPUT_KEYBOARD;
+        event.ki.wVk = key;
+
+        if (keyUp)
+            event.ki.dwFlags = KEYEVENTF_KEYUP;
+
+        events.push_back(event);
+    };
+
+    // Ctrl+A, then Backspace, sent as one ordered Windows input batch.
+    appendVk(selectAllEvents, VK_CONTROL, false);
+    appendVk(selectAllEvents, 'A', false);
+    appendVk(selectAllEvents, 'A', true);
+    appendVk(selectAllEvents, VK_CONTROL, true);
+    appendVk(selectAllEvents, VK_BACK, false);
+    appendVk(selectAllEvents, VK_BACK, true);
+
+    const UINT selectAllSent = SendInput(
+        static_cast<UINT>(selectAllEvents.size()),
+        selectAllEvents.data(),
+        sizeof(INPUT)
+    );
+
+    if (selectAllSent != selectAllEvents.size())
+    {
+        // Recover modifier state in case Windows accepted only part of the batch.
+        INPUT releaseModifiers[2]{};
+        releaseModifiers[0].type = INPUT_KEYBOARD;
+        releaseModifiers[0].ki.wVk = VK_CONTROL;
+        releaseModifiers[0].ki.dwFlags = KEYEVENTF_KEYUP;
+        releaseModifiers[1].type = INPUT_KEYBOARD;
+        releaseModifiers[1].ki.wVk = 'A';
+        releaseModifiers[1].ki.dwFlags = KEYEVENTF_KEYUP;
+        SendInput(2, releaseModifiers, sizeof(INPUT));
+
         diagnostic =
-            "Field was tapped using " + tapDiagnostic +
-            " but clearing failed: " + backspaceDiagnostic;
+            "Ctrl+A clear sequence failed. Win32 error: " +
+            std::to_string(GetLastError());
         return false;
     }
 
+    Sleep(18);
+
+    // Safety pass for fields that ignore Ctrl+A: End + 24 Backspaces.
+    INPUT endEvents[2]{};
+    endEvents[0].type = INPUT_KEYBOARD;
+    endEvents[0].ki.wVk = VK_END;
+    endEvents[1].type = INPUT_KEYBOARD;
+    endEvents[1].ki.wVk = VK_END;
+    endEvents[1].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    if (SendInput(2, endEvents, sizeof(INPUT)) != 2)
+    {
+        diagnostic =
+            "End key failed during field clear. Win32 error: " +
+            std::to_string(GetLastError());
+        return false;
+    }
+
+    for (int i = 0; i < 24; ++i)
+    {
+        INPUT backspaceEvents[2]{};
+
+        backspaceEvents[0].type = INPUT_KEYBOARD;
+        backspaceEvents[0].ki.wVk = VK_BACK;
+
+        backspaceEvents[1].type = INPUT_KEYBOARD;
+        backspaceEvents[1].ki.wVk = VK_BACK;
+        backspaceEvents[1].ki.dwFlags = KEYEVENTF_KEYUP;
+
+        if (SendInput(2, backspaceEvents, sizeof(INPUT)) != 2)
+        {
+            diagnostic =
+                "Backspace safety pass failed at key " +
+                std::to_string(i + 1) +
+                ". Win32 error: " +
+                std::to_string(GetLastError());
+            return false;
+        }
+    }
+
     diagnostic =
-        tapDiagnostic + " " + backspaceDiagnostic;
+        tapDiagnostic +
+        " REAL KEYBOARD CLEAR: Ctrl+A + Backspace + End + 24 Backspaces "
+        "without changing focus.";
 
     return true;
 }
@@ -1975,7 +2057,7 @@ bool DetectInputField(
         cv::Mat templateGray;
         cv::cvtColor(it->second, templateGray, cv::COLOR_BGR2GRAY);
 
-        const double scales[] = { 0.85, 0.90, 0.95, 1.0, 1.05, 1.10, 1.15 };
+        const double scales[] = { 0.95, 1.0, 1.05 };
         cv::Point bestLocation;
         cv::Size bestSize;
         double bestScore = -1.0;
@@ -2092,7 +2174,7 @@ bool WaitForInputField(
         }
 
         lastDiagnostic = currentDiagnostic;
-        Sleep(200);
+        Sleep(80);
     }
 
     diagnostic =
@@ -2828,7 +2910,7 @@ AutomationResult RunPhotonAutomation(
     // INITIAL DELAY
     // --------------------------------------------------------
 
-    log << "\nINITIAL DELAY: 5 SECONDS\n";
+    log << "\nINITIAL DELAY: " << INITIAL_DELAY_MS << " ms\n";
 
     Sleep(INITIAL_DELAY_MS);
 
@@ -2911,7 +2993,7 @@ AutomationResult RunPhotonAutomation(
             device.id,
             afterConfidence,
             afterDiagnostic,
-            10000
+            AFTER_LOGIN_TIMEOUT_MS
         );
 
         log << afterDiagnostic << "\n";
@@ -2969,7 +3051,7 @@ AutomationResult RunPhotonAutomation(
         "enter_name",
         firstNameCenter,
         nameDiagnostic,
-        60000))
+        25000))
     {
         log << "FIRST NAME FIELD NOT FOUND: " << nameDiagnostic << "\n";
         return result;
@@ -3031,7 +3113,7 @@ AutomationResult RunPhotonAutomation(
         "enter_lastname",
         lastNameCenter,
         surnameDiagnostic,
-        60000))
+        25000))
     {
         log << "LAST NAME FIELD NOT FOUND: " << surnameDiagnostic << "\n";
         return result;
@@ -3397,6 +3479,7 @@ void StartPhotonAutomation()
             AppendPhotonLog(
                 "Input mode: real Windows mouse and keyboard.\n"
                 "Live diagnostics enabled.\n"
+                "Physical mouse/keyboard are global, so devices run sequentially.\n"
             );
 
             // Desktop mouse/keyboard are global, so selected emulators
