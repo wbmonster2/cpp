@@ -602,21 +602,21 @@ bool InputADBText(
     const std::wstring serial = DeviceArgument(deviceId);
     const std::wstring text = Utf8ToWide(value);
 
-    // Quote text inside the Android shell, avoiding Windows/Android
-    // argument parsing differences observed on some LDPlayer versions.
+    // Force the keyboard source; this avoids builds where the default
+    // input source accepts the command but drops characters in WebView.
     std::wstring command =
         L"-s " + serial +
-        L" shell \"input text '" + text + L"'\"";
+        L" shell input keyboard text " + text;
 
     std::string output = ExecuteADB(command, 15000);
 
     if (!IsADBError(output))
     {
-        diagnostic = "Quoted Android input-text command sent.";
+        diagnostic = "Text sent using explicit Android keyboard source.";
         return true;
     }
 
-    // Stock Android-compatible fallback.
+    // Compatibility fallback for Android builds without source selection.
     command =
         L"-s " + serial +
         L" shell input text " + text;
@@ -625,11 +625,11 @@ bool InputADBText(
 
     if (IsADBError(output))
     {
-        diagnostic = "Both Android text-input methods failed: " + output;
+        diagnostic = "Keyboard and standard text input both failed: " + output;
         return false;
     }
 
-    diagnostic = "Direct Android input-text fallback sent.";
+    diagnostic = "Text sent using standard Android input-text fallback.";
     return true;
 }
 
@@ -950,7 +950,7 @@ bool LoadPhotonTemplates()
 
     status << "photon_after_login.png: " << diagnostic << "\n";
 
-    const std::array<std::string, 7> names =
+    const std::array<std::string, 9> names =
     {
         "play",
         "password",
@@ -958,7 +958,9 @@ bool LoadPhotonTemplates()
         "register",
         "skip",
         "next",
-        "start"
+        "start",
+        "enter_name",
+        "enter_lastname"
     };
 
     g_StageTemplates.clear();
@@ -1006,7 +1008,7 @@ bool LoadPhotonTemplates()
 
 bool AreAllStageTemplatesLoaded()
 {
-    const std::array<std::string, 7> names =
+    const std::array<std::string, 9> names =
     {
         "play",
         "password",
@@ -1014,7 +1016,9 @@ bool AreAllStageTemplatesLoaded()
         "register",
         "skip",
         "next",
-        "start"
+        "start",
+        "enter_name",
+        "enter_lastname"
     };
 
     for (const std::string& name : names)
@@ -1253,6 +1257,170 @@ bool DetectStage(
         center,
         diagnostic
     );
+}
+
+// Field placeholders can vary slightly due to WebView rendering.
+// Match in grayscale at several nearby scales and use a dedicated threshold.
+bool DetectInputField(
+    const std::string& deviceId,
+    const std::string& templateName,
+    double& confidence,
+    POINT& center,
+    std::string& diagnostic)
+{
+    confidence = 0.0;
+    center = { 0, 0 };
+
+    auto it = g_StageTemplates.find(templateName);
+    if (it == g_StageTemplates.end() || it->second.empty())
+    {
+        diagnostic = "Input-field template missing: " + templateName + ".png";
+        return false;
+    }
+
+    std::vector<unsigned char> screenshotData;
+    if (!CaptureADBScreenshot(deviceId, screenshotData))
+    {
+        diagnostic = "Screenshot capture failed while searching for " + templateName + ".png";
+        return false;
+    }
+
+    cv::Mat screenshot;
+    if (!DecodeImage(screenshotData, screenshot, diagnostic))
+        return false;
+
+    try
+    {
+        cv::Mat screenGray;
+        cv::cvtColor(screenshot, screenGray, cv::COLOR_BGR2GRAY);
+
+        cv::Mat templateGray;
+        cv::cvtColor(it->second, templateGray, cv::COLOR_BGR2GRAY);
+
+        const double scales[] = { 0.85, 0.90, 0.95, 1.0, 1.05, 1.10, 1.15 };
+        cv::Point bestLocation;
+        cv::Size bestSize;
+        double bestScore = -1.0;
+
+        for (double scale : scales)
+        {
+            const int width = static_cast<int>(std::round(templateGray.cols * scale));
+            const int height = static_cast<int>(std::round(templateGray.rows * scale));
+
+            if (width < 8 || height < 8 ||
+                width > screenGray.cols || height > screenGray.rows)
+                continue;
+
+            cv::Mat scaledTemplate;
+            cv::resize(
+                templateGray,
+                scaledTemplate,
+                cv::Size(width, height),
+                0.0,
+                0.0,
+                scale < 1.0 ? cv::INTER_AREA : cv::INTER_CUBIC
+            );
+
+            cv::Mat matchResult;
+            cv::matchTemplate(
+                screenGray,
+                scaledTemplate,
+                matchResult,
+                cv::TM_CCOEFF_NORMED
+            );
+
+            double minValue = 0.0;
+            double maxValue = 0.0;
+            cv::Point minLocation;
+            cv::Point maxLocation;
+
+            cv::minMaxLoc(
+                matchResult,
+                &minValue,
+                &maxValue,
+                &minLocation,
+                &maxLocation
+            );
+
+            if (std::isfinite(maxValue) && maxValue > bestScore)
+            {
+                bestScore = maxValue;
+                bestLocation = maxLocation;
+                bestSize = cv::Size(width, height);
+            }
+        }
+
+        if (bestScore < 0.0)
+        {
+            diagnostic = "Could not compare input-field template.";
+            return false;
+        }
+
+        confidence = bestScore;
+        center.x = bestLocation.x + bestSize.width / 2;
+        center.y = bestLocation.y + bestSize.height / 2;
+
+        diagnostic =
+            templateName + ".png field match: " +
+            std::to_string(confidence * 100.0) +
+            "% at (" + std::to_string(center.x) +
+            ", " + std::to_string(center.y) + ").";
+
+        return confidence >= 0.76;
+    }
+    catch (const cv::Exception& e)
+    {
+        diagnostic = std::string("OpenCV field matching error: ") + e.what();
+        return false;
+    }
+}
+
+bool WaitForInputField(
+    const std::string& deviceId,
+    const std::string& templateName,
+    POINT& center,
+    std::string& diagnostic,
+    int timeoutMs = 45000)
+{
+    const ULONGLONG started = GetTickCount64();
+    int consecutiveMatches = 0;
+    double confidence = 0.0;
+    std::string lastDiagnostic;
+
+    while (GetTickCount64() - started < static_cast<ULONGLONG>(timeoutMs))
+    {
+        POINT currentCenter{};
+        std::string currentDiagnostic;
+
+        if (DetectInputField(
+            deviceId,
+            templateName,
+            confidence,
+            currentCenter,
+            currentDiagnostic))
+        {
+            consecutiveMatches++;
+            center = currentCenter;
+
+            if (consecutiveMatches >= 2)
+            {
+                diagnostic = "INPUT FIELD CONFIRMED. " + currentDiagnostic;
+                return true;
+            }
+        }
+        else
+        {
+            consecutiveMatches = 0;
+        }
+
+        lastDiagnostic = currentDiagnostic;
+        Sleep(450);
+    }
+
+    diagnostic =
+        "TIMEOUT waiting for " + templateName +
+        ".png. Last result: " + lastDiagnostic;
+    return false;
 }
 
 // ============================================================
@@ -1766,99 +1934,104 @@ AutomationResult RunPhotonAutomation(
 // STEP 3: CLEAR NAME AND IMMEDIATELY INPUT NEW NAME
 // --------------------------------------------------------
 
-    log << "\n[3] CLEAR FIRST NAME\n";
+    log << "\n[3] FIND FIRST-NAME FIELD FROM enter_name.png\n";
 
     std::string nameDiagnostic;
+    POINT firstNameCenter{};
 
-    if (!ClearADBTextField(
+    if (!WaitForInputField(
         device.id,
-        185,
-        241,
-        nameDiagnostic))
+        "enter_name",
+        firstNameCenter,
+        nameDiagnostic,
+        60000))
     {
-        log << "ERROR: " << nameDiagnostic << "\n";
+        log << "FIRST NAME FIELD NOT FOUND: " << nameDiagnostic << "\n";
         return result;
     }
 
     log << nameDiagnostic << "\n";
 
-    // Генерируем имя и фамилию для этого устройства.
     auto generatedName = GenerateRoleplayName(device.id);
-
     const std::string firstName = generatedName.first;
     const std::string lastName = generatedName.second;
 
-    log << "\nGENERATED FIRST NAME: "
-        << firstName << "\n";
+    log << "\nGENERATED FIRST NAME: " << firstName << "\n";
+    log << "CLICKING FIRST-NAME FIELD AT ("
+        << firstNameCenter.x << ", " << firstNameCenter.y << ")\n";
 
-    // Re-focus the first-name field and allow Android IME/WebView
-    // to become active before injecting text.
-    if (!TapADB(device.id, 185, 241, nameDiagnostic))
+    if (!ClearADBTextField(
+        device.id,
+        firstNameCenter.x,
+        firstNameCenter.y,
+        nameDiagnostic))
     {
-        log << "FIRST NAME FIELD TAP ERROR: "
-            << nameDiagnostic << "\n";
+        log << "FIRST NAME FIELD CLEAR ERROR: " << nameDiagnostic << "\n";
         return result;
     }
 
-    Sleep(450);
+    log << "FIRST NAME FIELD: " << nameDiagnostic << "\n";
+    Sleep(250);
 
     std::string inputDiagnostic;
-
     if (!InputADBText(device.id, firstName, inputDiagnostic))
     {
-        log << "FIRST NAME INPUT ERROR: "
-            << inputDiagnostic << "\n";
+        log << "FIRST NAME INPUT ERROR: " << inputDiagnostic << "\n";
         return result;
     }
 
     log << "FIRST NAME INPUT: " << inputDiagnostic << "\n";
-    Sleep(350);
+    Sleep(700);
 
     // --------------------------------------------------------
-    // STEP 4: CLEAR SURNAME AND IMMEDIATELY INPUT IT
+    // STEP 4: FIND, CLEAR AND FILL SURNAME FIELD
     // --------------------------------------------------------
 
-    log << "\n[4] CLEAR LAST NAME\n";
+    log << "\n[4] FIND LAST-NAME FIELD FROM enter_lastname.png\n";
 
     std::string surnameDiagnostic;
+    POINT lastNameCenter{};
 
-    if (!ClearADBTextField(
+    if (!WaitForInputField(
         device.id,
-        185,
-        297,
-        surnameDiagnostic))
+        "enter_lastname",
+        lastNameCenter,
+        surnameDiagnostic,
+        60000))
     {
-        log << "ERROR: " << surnameDiagnostic << "\n";
+        log << "LAST NAME FIELD NOT FOUND: " << surnameDiagnostic << "\n";
         return result;
     }
 
     log << surnameDiagnostic << "\n";
+    log << "CLICKING LAST-NAME FIELD AT ("
+        << lastNameCenter.x << ", " << lastNameCenter.y << ")\n";
 
-    log << "\nGENERATED LAST NAME: "
-        << lastName << "\n";
-
-    log << "CREDENTIALS: login - \"" << firstName << "_"
-        << lastName << "\", password - \"" << password << "\"\n";
-
-    // Re-focus surname and give Android IME/WebView time to accept input.
-    if (!TapADB(device.id, 185, 297, surnameDiagnostic))
+    if (!ClearADBTextField(
+        device.id,
+        lastNameCenter.x,
+        lastNameCenter.y,
+        surnameDiagnostic))
     {
-        log << "LAST NAME FIELD TAP ERROR: "
-            << surnameDiagnostic << "\n";
+        log << "LAST NAME FIELD CLEAR ERROR: " << surnameDiagnostic << "\n";
         return result;
     }
 
-    Sleep(450);
+    log << "LAST NAME FIELD: " << surnameDiagnostic << "\n";
+    Sleep(250);
+
+    log << "\nGENERATED LAST NAME: " << lastName << "\n";
+    log << "CREDENTIALS: login - \"" << firstName << "_"
+        << lastName << "\", password - \"" << password << "\"\n";
 
     if (!InputADBText(device.id, lastName, inputDiagnostic))
     {
-        log << "LAST NAME INPUT ERROR: "
-            << inputDiagnostic << "\n";
+        log << "LAST NAME INPUT ERROR: " << inputDiagnostic << "\n";
         return result;
     }
 
     log << "LAST NAME INPUT: " << inputDiagnostic << "\n";
-    Sleep(350);
+    Sleep(700);
 
     // --------------------------------------------------------
     // STEP 5: CONFIRM INPUT COMMANDS
@@ -3092,7 +3265,9 @@ void DrawSettings()
         "register.png",
         "skip.png",
         "next.png",
-        "start.png"
+        "start.png",
+        "enter_name.png",
+        "enter_lastname.png"
     };
 
     for (const char* filename : filenames)
