@@ -853,8 +853,8 @@ bool ClearADBTextField(
     return true;
 }
 
-// Вводим только латинские буквы и цифры.
-// Это исключает проблемы с экранированием символов в ADB shell input text.
+// Generated names and configured passwords are restricted to ASCII letters/digits,
+// which can be translated reliably into ordinary Windows keyboard scan codes.
 bool IsSafeADBText(const std::string& value)
 {
     if (value.empty())
@@ -867,25 +867,6 @@ bool IsSafeADBText(const std::string& value)
     }
 
     return true;
-}
-
-// Detect errors printed by Android's input command even when the adb
-// process itself exits with code 0. Checking only the Windows process
-// exit code can incorrectly treat "Unknown command" as successful input.
-bool IsAndroidInputError(const std::string& output)
-{
-    std::string lower = output;
-    std::transform(
-        lower.begin(),
-        lower.end(),
-        lower.begin(),
-        [](unsigned char c) { return static_cast<char>(std::tolower(c)); }
-    );
-
-    return lower.find("error:") != std::string::npos ||
-        lower.find("unknown command") != std::string::npos ||
-        lower.find("usage: input") != std::string::npos ||
-        lower.find("input: not found") != std::string::npos;
 }
 
 bool InputADBText(
