@@ -462,7 +462,7 @@ std::wstring DeviceArgument(const std::string& deviceId)
 // ADB INPUT
 // ============================================================
 
-// Implemented below with Android text-input helpers.
+// Input helpers below use the visible Windows desktop mouse and keyboard.
 bool IsAndroidInputError(const std::string& output);
 
 // ============================================================
@@ -568,6 +568,17 @@ bool ActivateEmulatorWindow(
         ShowWindow(topLevelWindow, SW_RESTORE);
     else
         ShowWindow(topLevelWindow, SW_SHOW);
+
+    // A worker thread normally has no message queue. Create one before
+    // AttachThreadInput so Windows can temporarily join the input queues.
+    MSG queueMessage{};
+    PeekMessageW(
+        &queueMessage,
+        nullptr,
+        WM_USER,
+        WM_USER,
+        PM_NOREMOVE
+    );
 
     DWORD targetThreadId =
         GetWindowThreadProcessId(topLevelWindow, nullptr);
