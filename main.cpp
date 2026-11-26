@@ -1188,9 +1188,6 @@ bool ClearADBTextField(
     appendVk(selectAllEvents, 'A', false);
     appendVk(selectAllEvents, 'A', true);
     appendVk(selectAllEvents, VK_CONTROL, true);
-    appendVk(selectAllEvents, VK_BACK, false);
-    appendVk(selectAllEvents, VK_BACK, true);
-
     const UINT selectAllSent = SendInput(
         static_cast<UINT>(selectAllEvents.size()),
         selectAllEvents.data(),
@@ -1215,9 +1212,38 @@ bool ClearADBTextField(
         return false;
     }
 
+    // Give the first Backspace a real hold instead of an instantaneous
+    // down/up pair; some game text controls ignore very short key taps.
+    INPUT initialBackspaceDown{};
+    initialBackspaceDown.type = INPUT_KEYBOARD;
+    initialBackspaceDown.ki.wVk = VK_BACK;
+
+    if (SendInput(1, &initialBackspaceDown, sizeof(INPUT)) != 1)
+    {
+        diagnostic =
+            "Initial Backspace key-down failed. Win32 error: " +
+            std::to_string(GetLastError());
+        return false;
+    }
+
+    Sleep(35);
+
+    INPUT initialBackspaceUp{};
+    initialBackspaceUp.type = INPUT_KEYBOARD;
+    initialBackspaceUp.ki.wVk = VK_BACK;
+    initialBackspaceUp.ki.dwFlags = KEYEVENTF_KEYUP;
+
+    if (SendInput(1, &initialBackspaceUp, sizeof(INPUT)) != 1)
+    {
+        diagnostic =
+            "Initial Backspace key-up failed. Win32 error: " +
+            std::to_string(GetLastError());
+        return false;
+    }
+
     Sleep(18);
 
-    // Safety pass for fields that ignore Ctrl+A: End + 24 Backspaces.
+    // Safety pass for fields that ignore Ctrl+A: End + 24 held Backspaces.
     INPUT endEvents[2]{};
     endEvents[0].type = INPUT_KEYBOARD;
     endEvents[0].ki.wVk = VK_END;
@@ -1240,21 +1266,35 @@ bool ClearADBTextField(
         backspaceEvents[0].type = INPUT_KEYBOARD;
         backspaceEvents[0].ki.wVk = VK_BACK;
 
-        backspaceEvents[1].type = INPUT_KEYBOARD;
-        backspaceEvents[1].ki.wVk = VK_BACK;
-        backspaceEvents[1].ki.dwFlags = KEYEVENTF_KEYUP;
-
-        if (SendInput(2, backspaceEvents, sizeof(INPUT)) != 2)
+        if (SendInput(1, &backspaceEvents[0], sizeof(INPUT)) != 1)
         {
             diagnostic =
-                "Backspace safety pass failed at key " +
+                "Backspace key-down failed at key " +
                 std::to_string(i + 1) +
                 ". Win32 error: " +
                 std::to_string(GetLastError());
             return false;
         }
 
-        Sleep(3);
+        // Hold Backspace long enough for slower WebView/game input fields
+        // to process the key reliably, then release before the next press.
+        Sleep(28);
+
+        backspaceEvents[1].type = INPUT_KEYBOARD;
+        backspaceEvents[1].ki.wVk = VK_BACK;
+        backspaceEvents[1].ki.dwFlags = KEYEVENTF_KEYUP;
+
+        if (SendInput(1, &backspaceEvents[1], sizeof(INPUT)) != 1)
+        {
+            diagnostic =
+                "Backspace key-up failed at key " +
+                std::to_string(i + 1) +
+                ". Win32 error: " +
+                std::to_string(GetLastError());
+            return false;
+        }
+
+        Sleep(12);
     }
 
     diagnostic =
@@ -2458,6 +2498,176 @@ bool WaitAndTapStage(
 }
 
 // ============================================================
+// PHOTON MARKER DETECTION
+// The marker is rendered at a slightly different scale between emulator
+// captures. Search only the upper-left UI area, use multi-scale grayscale
+// matching, then verify that the candidate patch actually contains purple.
+// ============================================================
+
+bool DetectPhotonMarkerTemplate(
+    const std::string& deviceId,
+    const cv::Mat& templateImage,
+    double& confidence,
+    POINT& matchCenter,
+    std::string& diagnostic)
+{
+    confidence = 0.0;
+    matchCenter = { 0, 0 };
+
+    if (templateImage.empty())
+    {
+        diagnostic = "PHOTON marker template is empty.";
+        return false;
+    }
+
+    std::vector<unsigned char> screenshotData;
+    if (!CaptureADBScreenshot(deviceId, screenshotData))
+    {
+        diagnostic = "PHOTON marker screenshot capture failed.";
+        return false;
+    }
+
+    cv::Mat screenshot;
+    if (!DecodeImage(screenshotData, screenshot, diagnostic))
+        return false;
+
+    try
+    {
+        const cv::Rect searchArea(
+            0,
+            0,
+            std::min(360, screenshot.cols),
+            std::min(300, screenshot.rows));
+
+        if (searchArea.width < 16 || searchArea.height < 16)
+        {
+            diagnostic = "PHOTON marker search area is too small.";
+            return false;
+        }
+
+        cv::Mat screenRoi = screenshot(searchArea);
+        cv::Mat screenGray;
+        cv::cvtColor(screenRoi, screenGray, cv::COLOR_BGR2GRAY);
+
+        cv::Mat templateGray;
+        cv::cvtColor(templateImage, templateGray, cv::COLOR_BGR2GRAY);
+
+        const double scales[] =
+        {
+            0.55, 0.65, 0.75, 0.85, 0.95,
+            1.00, 1.10, 1.20, 1.30, 1.45, 1.60
+        };
+
+        double bestScore = -1.0;
+        cv::Point bestLocation{};
+        cv::Size bestSize{};
+
+        for (double scale : scales)
+        {
+            const int width = static_cast<int>(
+                std::round(templateGray.cols * scale));
+            const int height = static_cast<int>(
+                std::round(templateGray.rows * scale));
+
+            if (width < 12 || height < 12 ||
+                width > screenGray.cols || height > screenGray.rows)
+                continue;
+
+            cv::Mat scaledTemplate;
+            cv::resize(
+                templateGray,
+                scaledTemplate,
+                cv::Size(width, height),
+                0.0,
+                0.0,
+                scale < 1.0 ? cv::INTER_AREA : cv::INTER_CUBIC);
+
+            cv::Mat matchResult;
+            cv::matchTemplate(
+                screenGray,
+                scaledTemplate,
+                matchResult,
+                cv::TM_CCOEFF_NORMED);
+
+            double minValue = 0.0;
+            double maxValue = 0.0;
+            cv::Point minLocation;
+            cv::Point maxLocation;
+
+            cv::minMaxLoc(
+                matchResult,
+                &minValue,
+                &maxValue,
+                &minLocation,
+                &maxLocation);
+
+            if (std::isfinite(maxValue) && maxValue > bestScore)
+            {
+                bestScore = maxValue;
+                bestLocation = maxLocation;
+                bestSize = cv::Size(width, height);
+            }
+        }
+
+        if (bestScore < 0.0)
+        {
+            diagnostic = "PHOTON marker: no valid template scale.";
+            return false;
+        }
+
+        // Purple verification reduces accidental matches against unrelated
+        // UI elements in the same corner of the game screen.
+        cv::Mat hsv;
+        cv::cvtColor(screenRoi, hsv, cv::COLOR_BGR2HSV);
+
+        const cv::Rect candidateRect(
+            bestLocation.x,
+            bestLocation.y,
+            bestSize.width,
+            bestSize.height);
+
+        cv::Mat candidateHsv = hsv(candidateRect);
+        cv::Mat purpleMask;
+        cv::inRange(
+            candidateHsv,
+            cv::Scalar(112, 55, 35),
+            cv::Scalar(175, 255, 255),
+            purpleMask);
+
+        const double purpleRatio =
+            static_cast<double>(cv::countNonZero(purpleMask)) /
+            static_cast<double>(std::max(1, candidateRect.area()));
+
+        confidence = bestScore;
+        matchCenter.x =
+            searchArea.x + bestLocation.x + bestSize.width / 2;
+        matchCenter.y =
+            searchArea.y + bestLocation.y + bestSize.height / 2;
+
+        diagnostic =
+            "PHOTON marker multi-scale match: " +
+            std::to_string(bestScore * 100.0) +
+            "%, purple pixels: " +
+            std::to_string(purpleRatio * 100.0) +
+            "%, center: (" +
+            std::to_string(matchCenter.x) + ", " +
+            std::to_string(matchCenter.y) + ").";
+
+        return bestScore >= 0.60 && purpleRatio >= 0.035;
+    }
+    catch (const cv::Exception& e)
+    {
+        diagnostic = std::string("PHOTON marker OpenCV error: ") + e.what();
+        return false;
+    }
+    catch (const std::exception& e)
+    {
+        diagnostic = std::string("PHOTON marker error: ") + e.what();
+        return false;
+    }
+}
+
+// ============================================================
 // POST-AUTOMATION IMAGE SEQUENCE
 // ============================================================
 
@@ -2493,13 +2703,21 @@ bool WaitForAndTapExternalTemplate(
         POINT center{};
         std::string diagnostic;
 
-        const bool found = DetectPhotonTemplate(
-            deviceId,
-            image,
-            confidence,
-            center,
-            diagnostic
-        );
+        const bool isPhotonMarker = (filename == "photon_marker.png");
+
+        const bool found = isPhotonMarker
+            ? DetectPhotonMarkerTemplate(
+                deviceId,
+                image,
+                confidence,
+                center,
+                diagnostic)
+            : DetectPhotonTemplate(
+                deviceId,
+                image,
+                confidence,
+                center,
+                diagnostic);
 
         if (found)
         {
