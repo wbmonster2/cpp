@@ -2317,32 +2317,75 @@ bool RunPostAutomationImageSequence(
             return false;
     }
 
-    for (size_t i = 0; i < names.size(); ++i)
+    double score = 0.0;
+    POINT center{};
+    std::string diagnostic;
+    cv::Size originalSize;
+    const auto detectMarker = [&](double& confidence, POINT& point, std::string& last, ULONGLONG deadline)
+    {
+        return DetectPhotonMarkerTemplate(deviceId, templates[0], confidence, point, last, deadline, originalSize);
+    };
+    log << "Waiting for photon_marker\n";
+    if (!WaitForTemplate(names[0], STAGE_TIMEOUT_MS, 2, detectMarker, score, center, diagnostic))
+    {
+        log << diagnostic << "\n";
+        return false;
+    }
+    log << diagnostic << "\n";
+    const POINT tappedCenter = center;
+    const bool tapSent = TapPhotonMarker(deviceId, center, originalSize, diagnostic);
+    log << (tapSent ? "" : "ADB marker tap failed. ") << diagnostic << "\n";
+
+    for (size_t i = 1; i < names.size(); ++i)
     {
         log << "Waiting for " << names[i] << "\n";
-        double confidence = 0.0;
-        POINT center{};
-        std::string diagnostic;
-        const bool marker = i == 0;
-        cv::Size originalSize;
-        if (!WaitForTemplate(names[i], STAGE_TIMEOUT_MS, 2,
-            [&](double& score, POINT& point, std::string& last, ULONGLONG deadline)
-            {
-                if (marker)
-                    return DetectPhotonMarkerTemplate(deviceId, templates[i], score, point, last, deadline, originalSize);
-                return DetectPhotonTemplate(deviceId, templates[i], score, point, last, deadline);
-            },
-            confidence, center, diagnostic))
+        std::string lastImageMatch;
+        const auto detectTarget = [&](double& confidence, POINT& point, std::string& last, ULONGLONG deadline)
+        {
+            const bool found = DetectPhotonTemplate(deviceId, templates[i], confidence, point, last, deadline);
+            if (last.rfind("Match: ", 0) == 0)
+                lastImageMatch = last;
+            return found;
+        };
+        bool found = WaitForTemplate(names[i], i == 1 ? 6000 : STAGE_TIMEOUT_MS,
+            2, detectTarget, score, center, diagnostic);
+        if (i == 1 && !found && !IsAutomationCancelled())
         {
             log << diagnostic << "\n";
+            POINT markerCenter{};
+            std::string markerDiagnostic;
+            if (WaitForTemplate(names[0], 4500, 2, detectMarker, score, markerCenter, markerDiagnostic) &&
+                MatchesAreStable(tappedCenter, markerCenter))
+            {
+                // Check for a late transition before pressing the marker a second time.
+                found = detectTarget(score, center, diagnostic, GetTickCount64() + 4000);
+                if (found)
+                    found = WaitForTemplate(names[i], 4500, 2, detectTarget, score, center, diagnostic);
+                else if (diagnostic.rfind("Match: ", 0) == 0 && !IsAutomationCancelled())
+                {
+                    log << "Marker still visible. Trying a Windows mouse press (160 ms).\n";
+                    const bool pressed = ClickEmulator(deviceId, markerCenter.x, markerCenter.y, 160, false, diagnostic);
+                    log << (pressed ? "" : "Marker mouse press failed. ") << diagnostic << "\n";
+                }
+            }
+            else
+            {
+                log << "Original marker position no longer confirmed. " << markerDiagnostic << "\n";
+            }
+            if (!found)
+                found = WaitForTemplate(names[i], STAGE_TIMEOUT_MS, 2, detectTarget, score, center, diagnostic);
+        }
+
+        if (!found)
+        {
+            log << diagnostic << "\n";
+            if (!lastImageMatch.empty())
+                log << "Last image comparison: " << lastImageMatch << "\n";
             return false;
         }
 
         log << diagnostic << "\n";
-        const bool clicked = marker
-            ? TapPhotonMarker(deviceId, center, originalSize, diagnostic)
-            : TapADB(deviceId, center.x, center.y, diagnostic);
-        if (!clicked)
+        if (!TapADB(deviceId, center.x, center.y, diagnostic))
         {
             log << "Click failed. " << diagnostic << "\n";
             return false;
@@ -3085,7 +3128,7 @@ AutomationResult RunPhotonAutomation(
     // STEP 7: CLICK PLAY AFTER ENTERING THE NEW NAME
     // --------------------------------------------------------
 
-    log << "\n[7] WAIT FOR PLAY / ИГРАТЬ BUTTON\n";
+    log << "\n[7] WAIT FOR PLAY BUTTON\n";
 
     if (!WaitAndTapStage(device.id, "play", log))
     {
