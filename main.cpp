@@ -2,6 +2,10 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
+
 #include <windows.h>
 #include <d3d11.h>
 #include <tchar.h>
@@ -11,9 +15,10 @@
 #include <vector>
 #include <sstream>
 #include <algorithm>
-#include <fstream>
+#include <future>
 #include <exception>
 #include <cstdint>
+#include <cwctype>
 #include <thread>
 #include <atomic>
 #include <mutex>
@@ -29,12 +34,15 @@
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
 
-#include <opencv2/opencv.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
 
+#ifdef _MSC_VER
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
+#endif
 
 // ============================================================
 // CONFIGURATION
@@ -72,14 +80,71 @@ static std::string g_ADBStatus = "Not connected";
 static std::string g_Notification = "SmartClick initialized";
 
 static int g_CurrentPage = 0;
-static int g_SelectedDevice = -1;
 static int g_SelectedWindow = -1;
 
 static std::atomic<bool> g_AutomationBusy{ false };
+static std::atomic<bool> g_CancelAutomation{ false };
+static std::atomic<bool> g_ShutdownRequested{ false };
 static std::thread g_AutomationThread;
+static std::string g_AutomationNotification;
+
+struct AdbJobResult
+{
+    bool launch = false;
+    std::string output;
+    std::string notification;
+};
+
+static std::future<AdbJobResult> g_ADBJob;
 static std::mutex g_LogMutex;
 
-static char g_RegistrationPassword[128] = "SmartClick123";
+static char g_RegistrationPassword[128]{};
+
+bool IsAutomationCancelled()
+{
+    return g_CancelAutomation || g_ShutdownRequested;
+}
+
+bool PauseAutomation(DWORD milliseconds)
+{
+    const ULONGLONG deadline = GetTickCount64() + milliseconds;
+    while (!IsAutomationCancelled())
+    {
+        const ULONGLONG now = GetTickCount64();
+        if (now >= deadline)
+            return true;
+
+        Sleep(static_cast<DWORD>(std::min<ULONGLONG>(20, deadline - now)));
+    }
+    return false;
+}
+
+DWORD RemainingTime(ULONGLONG deadline)
+{
+    const ULONGLONG now = GetTickCount64();
+    return now < deadline
+        ? static_cast<DWORD>(std::min<ULONGLONG>(deadline - now, MAXDWORD))
+        : 0;
+}
+
+static void AppendPhotonLog(const char* data, size_t length)
+{
+    std::lock_guard<std::mutex> lock(g_LogMutex);
+    g_PhotonDetectionLog.append(data, length);
+
+    constexpr size_t limit = 256 * 1024;
+    if (g_PhotonDetectionLog.size() > limit)
+    {
+        const size_t excess = g_PhotonDetectionLog.size() - limit;
+        const size_t newline = g_PhotonDetectionLog.find('\n', excess);
+        g_PhotonDetectionLog.erase(0, newline == std::string::npos ? excess : newline + 1);
+    }
+}
+
+static void AppendPhotonLog(const std::string& message)
+{
+    AppendPhotonLog(message.data(), message.size());
+}
 
 // Streams worker-thread log output directly into the UI-visible log.
 // Every write is protected so the render thread can safely take a snapshot.
@@ -92,11 +157,7 @@ protected:
     {
         if (data && count > 0)
         {
-            std::lock_guard<std::mutex> lock(g_LogMutex);
-            g_PhotonDetectionLog.append(
-                data,
-                static_cast<size_t>(count)
-            );
+            AppendPhotonLog(data, static_cast<size_t>(count));
         }
 
         return count;
@@ -111,8 +172,7 @@ protected:
             const char value =
                 traits_type::to_char_type(character);
 
-            std::lock_guard<std::mutex> lock(g_LogMutex);
-            g_PhotonDetectionLog.push_back(value);
+            AppendPhotonLog(&value, 1);
         }
 
         return traits_type::not_eof(character);
@@ -124,15 +184,22 @@ protected:
     }
 };
 
-static void AppendPhotonLog(const std::string& message)
-{
-    std::lock_guard<std::mutex> lock(g_LogMutex);
-    g_PhotonDetectionLog += message;
-}
-
 // ============================================================
 // IMAGE TEMPLATES
 // ============================================================
+
+static const std::array<std::string, 9> g_RegistrationTemplates =
+{
+    "play",
+    "password",
+    "password_repeat",
+    "register",
+    "skip",
+    "next",
+    "start",
+    "enter_name",
+    "enter_lastname"
+};
 
 static cv::Mat g_PhotonReadyTemplate;
 static cv::Mat g_PhotonAfterLoginTemplate;
@@ -153,6 +220,9 @@ static ID3D11RenderTargetView* g_mainRenderTargetView = nullptr;
 
 static HWND g_hWnd = nullptr;
 static bool g_Running = true;
+static bool g_Minimized = false;
+static UINT g_PendingWidth = 0;
+static UINT g_PendingHeight = 0;
 
 // ============================================================
 // DATA
@@ -188,7 +258,12 @@ static std::vector<EmulatorWindow> g_EmulatorWindows;
 // Real Win32 input is global to the desktop, so automation is serialized.
 // Each ADB device is explicitly mapped to its visible LDPlayer top-level HWND.
 static std::mutex g_DeviceWindowMapMutex;
-static std::map<std::string, HWND> g_DeviceWindowMap;
+struct WindowIdentity
+{
+    HWND handle = nullptr;
+    DWORD processId = 0;
+};
+static std::map<std::string, WindowIdentity> g_DeviceWindowMap;
 
 static const char* g_PageNames[] =
 {
@@ -308,167 +383,264 @@ bool ContainsIgnoreCase(
 // PROCESS EXECUTION
 // ============================================================
 
+class UniqueHandle
+{
+public:
+    explicit UniqueHandle(HANDLE handle) : handle_(handle) {}
+    ~UniqueHandle() { reset(nullptr); }
+
+    UniqueHandle(const UniqueHandle&) = delete;
+    UniqueHandle& operator=(const UniqueHandle&) = delete;
+
+    HANDLE get() const { return handle_; }
+
+    void reset(HANDLE handle)
+    {
+        if (handle_ && handle_ != INVALID_HANDLE_VALUE)
+            CloseHandle(handle_);
+        handle_ = handle;
+    }
+
+private:
+    HANDLE handle_;
+};
+
+std::wstring ReadEnvironmentVariable(const wchar_t* name)
+{
+    const DWORD capacity = GetEnvironmentVariableW(name, nullptr, 0);
+    if (!capacity)
+        return {};
+
+    std::wstring value(capacity, L'\0');
+    const DWORD length = GetEnvironmentVariableW(name, value.data(), capacity);
+    if (!length || length >= capacity)
+        return {};
+
+    value.resize(length);
+    return value;
+}
+
+std::wstring ResolveADBPath()
+{
+    std::wstring configured = ReadEnvironmentVariable(L"SMARTCLICK_ADB_PATH");
+    if (!configured.empty())
+        return configured;
+
+    const DWORD attributes = GetFileAttributesW(ADB_PATH);
+    if (attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY))
+        return ADB_PATH;
+
+    const std::wstring path = ReadEnvironmentVariable(L"PATH");
+    if (!path.empty())
+    {
+        std::wstring found(32768, L'\0');
+        const DWORD length = SearchPathW(
+            path.c_str(), L"adb.exe", nullptr,
+            static_cast<DWORD>(found.size()), found.data(), nullptr);
+        if (length && length < found.size())
+        {
+            found.resize(length);
+            return found;
+        }
+    }
+
+    return {};
+}
+
+const std::wstring& ADBExecutable()
+{
+    static const std::wstring path = ResolveADBPath();
+    return path;
+}
+
+std::wstring QuoteProcessArgument(const std::wstring& argument)
+{
+    std::wstring quoted = L"\"";
+    size_t backslashes = 0;
+    for (wchar_t character : argument)
+    {
+        if (character == L'\\')
+        {
+            ++backslashes;
+            continue;
+        }
+
+        if (character == L'"')
+            quoted.append(backslashes + 1, L'\\');
+        quoted.append(backslashes, L'\\');
+        quoted.push_back(character);
+        backslashes = 0;
+    }
+
+    quoted.append(backslashes * 2, L'\\');
+    quoted.push_back(L'"');
+    return quoted;
+}
+
+std::string Win32Error(const char* operation)
+{
+    const DWORD error = GetLastError();
+    return std::string(operation) + " (Win32 error " + std::to_string(error) + ").";
+}
+
 bool RunProcess(
     const std::wstring& executable,
     const std::wstring& arguments,
     std::vector<unsigned char>& output,
+    std::string& diagnostic,
     DWORD timeoutMs,
-    bool captureStderr = true)
+    bool captureStderr = true,
+    bool automation = false)
 {
     output.clear();
-
-    SECURITY_ATTRIBUTES security{};
-    security.nLength = sizeof(SECURITY_ATTRIBUTES);
-    security.bInheritHandle = TRUE;
-
-    HANDLE readPipe = nullptr;
-    HANDLE writePipe = nullptr;
-
-    if (!CreatePipe(&readPipe, &writePipe, &security, 0))
-        return false;
-
-    SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
-
-    HANDLE nullHandle = CreateFileW(
-        L"NUL",
-        GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        &security,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
-        nullptr
-    );
-
-    STARTUPINFOW startup{};
-    startup.cb = sizeof(startup);
-    startup.dwFlags = STARTF_USESTDHANDLES;
-    startup.hStdOutput = writePipe;
-    startup.hStdError = captureStderr ? writePipe : nullHandle;
-    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-
-    PROCESS_INFORMATION process{};
-
-    std::wstring command =
-        L"\"" + executable + L"\" " + arguments;
-
-    BOOL created = CreateProcessW(
-        executable.c_str(),
-        command.data(),
-        nullptr,
-        nullptr,
-        TRUE,
-        CREATE_NO_WINDOW,
-        nullptr,
-        nullptr,
-        &startup,
-        &process
-    );
-
-    CloseHandle(writePipe);
-
-    if (nullHandle != INVALID_HANDLE_VALUE)
-        CloseHandle(nullHandle);
-
-    if (!created)
+    diagnostic.clear();
+    if (executable.empty())
     {
-        CloseHandle(readPipe);
+        diagnostic = "ADB executable not found. Set SMARTCLICK_ADB_PATH to adb.exe.";
         return false;
     }
 
-    ULONGLONG startTime = GetTickCount64();
-
-    bool processFinished = false;
-    bool pipeFinished = false;
-    bool timedOut = false;
-
-    unsigned char buffer[16384];
-
-    while (!pipeFinished)
+    if (g_ShutdownRequested || (automation && g_CancelAutomation))
     {
-        DWORD available = 0;
+        diagnostic = "ADB command cancelled.";
+        return false;
+    }
 
-        BOOL peekResult = PeekNamedPipe(
-            readPipe,
-            nullptr,
-            0,
-            nullptr,
-            &available,
-            nullptr
-        );
+    std::wstring command = QuoteProcessArgument(executable) + L" " + arguments;
+    UniqueHandle readHandle(nullptr);
+    PROCESS_INFORMATION process{};
+    {
+        // Close inheritable handles before allowing another child to start.
+        static std::mutex launchMutex;
+        std::lock_guard<std::mutex> lock(launchMutex);
 
-        if (!peekResult)
+        SECURITY_ATTRIBUTES security{ sizeof(security), nullptr, TRUE };
+        HANDLE readPipe = nullptr;
+        HANDLE writePipe = nullptr;
+        if (!CreatePipe(&readPipe, &writePipe, &security, 0))
         {
-            pipeFinished = true;
+            diagnostic = Win32Error("Cannot create ADB output pipe");
+            return false;
+        }
+        readHandle.reset(readPipe);
+        const UniqueHandle writeHandle(writePipe);
+
+        const bool nonInheritable =
+            SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0) != FALSE;
+        if (!nonInheritable)
+        {
+            diagnostic = Win32Error("Cannot configure ADB output pipe");
+            return false;
+        }
+
+        const UniqueHandle nullHandle(CreateFileW(
+            L"NUL", GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, &security,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+        if (nullHandle.get() == INVALID_HANDLE_VALUE)
+        {
+            diagnostic = Win32Error("Cannot open NUL for ADB");
+            return false;
+        }
+
+        STARTUPINFOW startup{};
+        startup.cb = sizeof(startup);
+        startup.dwFlags = STARTF_USESTDHANDLES;
+        startup.hStdInput = nullHandle.get();
+        startup.hStdOutput = writeHandle.get();
+        startup.hStdError = captureStderr ? writeHandle.get() : nullHandle.get();
+
+        if (!CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr,
+            TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process))
+        {
+            diagnostic = Win32Error("Cannot start ADB");
+            return false;
+        }
+    }
+
+    const UniqueHandle processHandle(process.hProcess);
+    const UniqueHandle threadHandle(process.hThread);
+    const ULONGLONG started = GetTickCount64();
+    constexpr size_t maxOutputBytes = 16 * 1024 * 1024;
+    unsigned char buffer[16384];
+    bool pipeClosed = false;
+
+    for (;;)
+    {
+        const DWORD waitResult = WaitForSingleObject(processHandle.get(), 0);
+        const bool exited = waitResult == WAIT_OBJECT_0;
+        if (waitResult == WAIT_FAILED)
+        {
+            diagnostic = Win32Error("Cannot wait for ADB");
+            break;
+        }
+        if (g_ShutdownRequested || (automation && g_CancelAutomation))
+        {
+            diagnostic = "ADB command cancelled.";
             break;
         }
 
-        if (available > 0)
+        DWORD available = 0;
+        if (!pipeClosed && !PeekNamedPipe(readHandle.get(), nullptr, 0, nullptr, &available, nullptr))
         {
-            DWORD bytesRead = 0;
-
-            DWORD toRead = std::min<DWORD>(
-                available,
-                static_cast<DWORD>(sizeof(buffer))
-            );
-
-            if (ReadFile(
-                readPipe,
-                buffer,
-                toRead,
-                &bytesRead,
-                nullptr) && bytesRead > 0)
+            if (GetLastError() != ERROR_BROKEN_PIPE)
             {
-                output.insert(
-                    output.end(),
-                    buffer,
-                    buffer + bytesRead
-                );
+                diagnostic = Win32Error("Cannot inspect ADB output pipe");
+                break;
             }
+            pipeClosed = true;
         }
 
-        if (WaitForSingleObject(process.hProcess, 0) == WAIT_OBJECT_0)
-            processFinished = true;
-
-        if (!processFinished &&
-            GetTickCount64() - startTime >= timeoutMs)
+        if (!available && exited)
         {
-            timedOut = true;
-            TerminateProcess(process.hProcess, 1);
-            WaitForSingleObject(process.hProcess, 2000);
-            processFinished = true;
-        }
-
-        if (processFinished && available == 0)
-        {
-            DWORD remaining = 0;
-
-            if (!PeekNamedPipe(
-                readPipe,
-                nullptr,
-                0,
-                nullptr,
-                &remaining,
-                nullptr) || remaining == 0)
+            DWORD exitCode = 0;
+            if (!GetExitCodeProcess(processHandle.get(), &exitCode))
             {
-                pipeFinished = true;
+                diagnostic = Win32Error("Cannot get ADB exit code");
+                return false;
             }
+            if (exitCode == 0)
+                return true;
+
+            diagnostic = "ADB exited with code " + std::to_string(exitCode) + ".";
+            return false;
         }
 
-        if (!processFinished || available == 0)
-            Sleep(5);
+        const ULONGLONG elapsed = GetTickCount64() - started;
+        if (elapsed >= timeoutMs)
+        {
+            diagnostic = "ADB command timed out after " + std::to_string(timeoutMs) + " ms.";
+            break;
+        }
+
+        if (!available)
+        {
+            WaitForSingleObject(processHandle.get(),
+                static_cast<DWORD>(std::min<ULONGLONG>(5, timeoutMs - elapsed)));
+            continue;
+        }
+
+        DWORD bytesRead = 0;
+        const DWORD requested = std::min<DWORD>(available, sizeof(buffer));
+        if (!ReadFile(readHandle.get(), buffer, requested, &bytesRead, nullptr) || !bytesRead)
+        {
+            diagnostic = Win32Error("Cannot read ADB output");
+            break;
+        }
+        if (bytesRead > maxOutputBytes - output.size())
+        {
+            diagnostic = "ADB output exceeded 16 MiB.";
+            break;
+        }
+        output.insert(output.end(), buffer, buffer + bytesRead);
     }
 
-    CloseHandle(readPipe);
-
-    DWORD exitCode = 1;
-
-    if (!timedOut)
-        GetExitCodeProcess(process.hProcess, &exitCode);
-
-    CloseHandle(process.hThread);
-    CloseHandle(process.hProcess);
-
-    return !timedOut && exitCode == 0;
+    if (WaitForSingleObject(processHandle.get(), 0) == WAIT_TIMEOUT &&
+        TerminateProcess(processHandle.get(), 1))
+    {
+        WaitForSingleObject(processHandle.get(), 250);
+    }
+    return false;
 }
 
 std::string ExecuteADB(
@@ -476,26 +648,14 @@ std::string ExecuteADB(
     DWORD timeoutMs = 10000)
 {
     std::vector<unsigned char> data;
+    std::string diagnostic;
+    const bool success = RunProcess(ADBExecutable(), arguments, data, diagnostic, timeoutMs);
+    const std::string output(data.begin(), data.end());
 
-    bool success = RunProcess(
-        ADB_PATH,
-        arguments,
-        data,
-        timeoutMs,
-        true
-    );
+    if (success)
+        return output;
 
-    std::string output(data.begin(), data.end());
-
-    if (!success)
-    {
-        if (output.empty())
-            output = "ADB process failed or timed out.";
-
-        return "ERROR: " + output;
-    }
-
-    return output;
+    return "ERROR: " + diagnostic + (output.empty() ? "" : "\n" + output);
 }
 
 bool IsADBError(const std::string& output)
@@ -505,15 +665,8 @@ bool IsADBError(const std::string& output)
 
 std::wstring DeviceArgument(const std::string& deviceId)
 {
-    return Utf8ToWide(deviceId);
+    return QuoteProcessArgument(Utf8ToWide(deviceId));
 }
-
-// ============================================================
-// ADB INPUT
-// ============================================================
-
-// Input helpers below use the visible Windows desktop mouse and keyboard.
-bool IsAndroidInputError(const std::string& output);
 
 // ============================================================
 // REAL WINDOWS INPUT (VISIBLE MOUSE + KEYBOARD)
@@ -527,7 +680,10 @@ HWND GetMappedEmulatorWindow(const std::string& deviceId)
     if (it == g_DeviceWindowMap.end())
         return nullptr;
 
-    return it->second;
+    const WindowIdentity& identity = it->second;
+    DWORD processId = 0;
+    GetWindowThreadProcessId(identity.handle, &processId);
+    return processId && processId == identity.processId ? identity.handle : nullptr;
 }
 
 struct RenderChildSearch
@@ -589,12 +745,24 @@ HWND FindEmulatorRenderWindow(HWND topLevelWindow)
     return search.bestWindow ? search.bestWindow : topLevelWindow;
 }
 
+bool IsForegroundEmulator(HWND window)
+{
+    const HWND foreground = GetForegroundWindow();
+    return window && foreground && GetAncestor(foreground, GA_ROOT) == window;
+}
+
 bool ActivateEmulatorWindow(
     const std::string& deviceId,
     HWND& topLevelWindow,
     HWND& renderWindow,
     std::string& diagnostic)
 {
+    if (IsAutomationCancelled())
+    {
+        diagnostic = "Input cancelled.";
+        return false;
+    }
+
     topLevelWindow = GetMappedEmulatorWindow(deviceId);
 
     if (!topLevelWindow || !IsWindow(topLevelWindow))
@@ -604,6 +772,30 @@ bool ActivateEmulatorWindow(
             deviceId +
             ". Assign the matching window in Emulator Manager.";
         return false;
+    }
+
+    if (IsHungAppWindow(topLevelWindow))
+    {
+        diagnostic = "The assigned LDPlayer window is not responding.";
+        return false;
+    }
+
+    if (IsIconic(topLevelWindow))
+    {
+        ShowWindowAsync(topLevelWindow, SW_RESTORE);
+        for (int attempt = 0; attempt < 25 && IsIconic(topLevelWindow); ++attempt)
+        {
+            if (!PauseAutomation(20))
+            {
+                diagnostic = "Input cancelled while restoring LDPlayer.";
+                return false;
+            }
+        }
+        if (IsIconic(topLevelWindow))
+        {
+            diagnostic = "Could not restore the minimized LDPlayer window.";
+            return false;
+        }
     }
 
     // Recalculate the actual game surface for every action. The user may
@@ -616,14 +808,11 @@ bool ActivateEmulatorWindow(
         return false;
     }
 
-    if (IsIconic(topLevelWindow))
-        ShowWindow(topLevelWindow, SW_RESTORE);
-
     SetWindowPos(
         topLevelWindow,
         HWND_TOP,
         0, 0, 0, 0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+        SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS
     );
 
     // Ensure this worker thread has a message queue before attaching input.
@@ -677,26 +866,13 @@ bool ActivateEmulatorWindow(
 
     Sleep(25);
 
-    HWND foreground = GetForegroundWindow();
-    HWND foregroundRoot = foreground
-        ? GetAncestor(foreground, GA_ROOT)
-        : nullptr;
-    HWND foregroundRootOwner = foreground
-        ? GetAncestor(foreground, GA_ROOTOWNER)
-        : nullptr;
-
-    const bool isForeground =
-        foreground == topLevelWindow ||
-        foregroundRoot == topLevelWindow ||
-        foregroundRootOwner == topLevelWindow;
-
     if (attachedTarget)
         AttachThreadInput(currentThreadId, targetThreadId, FALSE);
 
     if (attachedForeground)
         AttachThreadInput(currentThreadId, foregroundThreadId, FALSE);
 
-    if (!isForeground)
+    if (!IsForegroundEmulator(topLevelWindow))
     {
         diagnostic =
             "Foreground activation failed for this LDPlayer instance. "
@@ -743,411 +919,186 @@ bool GetScreenPointForEmulator(
         return false;
     }
 
-    screenPoint.x = origin.x +
-        static_cast<LONG>(std::lround(
-            static_cast<double>(x) * width / SCREEN_WIDTH
-        ));
-
-    screenPoint.y = origin.y +
-        static_cast<LONG>(std::lround(
-            static_cast<double>(y) * height / SCREEN_HEIGHT
-        ));
+    // Use the center of the source pixel and keep the result inside the client.
+    screenPoint.x = origin.x + static_cast<LONG>(
+        (static_cast<long long>(2 * x + 1) * width) / (2 * SCREEN_WIDTH));
+    screenPoint.y = origin.y + static_cast<LONG>(
+        (static_cast<long long>(2 * y + 1) * height) / (2 * SCREEN_HEIGHT));
 
     return true;
 }
 
-bool SendVirtualKey(WORD virtualKey, std::string& diagnostic)
+bool IsPointOnEmulator(HWND topLevelWindow, HWND renderWindow, POINT point)
 {
-    INPUT events[2]{};
-
-    events[0].type = INPUT_KEYBOARD;
-    events[0].ki.wVk = virtualKey;
-
-    events[1].type = INPUT_KEYBOARD;
-    events[1].ki.wVk = virtualKey;
-    events[1].ki.dwFlags = KEYEVENTF_KEYUP;
-
-    const UINT sent = SendInput(
-        2,
-        events,
-        sizeof(INPUT)
-    );
-
-    if (sent != 2)
-    {
-        diagnostic =
-            "SendInput keyboard failed. Win32 error: " +
-            std::to_string(GetLastError());
-        return false;
-    }
-
-    return true;
+    const HWND hit = WindowFromPoint(point);
+    return IsForegroundEmulator(topLevelWindow) && hit &&
+        (hit == topLevelWindow || hit == renderWindow || IsChild(renderWindow, hit)) &&
+        GetAncestor(hit, GA_ROOT) == topLevelWindow;
 }
 
-// Dedicated login-button click. The login screen can be more sensitive to
-// focus transitions than later in-game controls, so it has two real mouse paths.
-bool TapLoginButton(
+bool ClickEmulator(
     const std::string& deviceId,
     int x,
     int y,
-    int attempt,
+    DWORD holdMs,
+    bool legacyClick,
     std::string& diagnostic)
 {
-    if (x < 0 || x >= SCREEN_WIDTH ||
-        y < 0 || y >= SCREEN_HEIGHT)
+    if (x < 0 || x >= SCREEN_WIDTH || y < 0 || y >= SCREEN_HEIGHT)
     {
-        diagnostic = "Login button coordinates are outside the game screen.";
+        diagnostic = "Invalid click coordinates.";
         return false;
     }
 
     HWND topLevelWindow = nullptr;
     HWND renderWindow = nullptr;
+    if (!ActivateEmulatorWindow(deviceId, topLevelWindow, renderWindow, diagnostic))
+        return false;
 
-    if (!ActivateEmulatorWindow(
-        deviceId,
-        topLevelWindow,
-        renderWindow,
-        diagnostic))
+    POINT point{};
+    if (!GetScreenPointForEmulator(renderWindow, x, y, point, diagnostic))
+        return false;
+
+    if (!IsPointOnEmulator(topLevelWindow, renderWindow, point))
     {
-        diagnostic = "Login focus failed: " + diagnostic;
+        diagnostic = "Click cancelled. The LDPlayer render area is covered or out of focus.";
+        return false;
+    }
+    if (!SetCursorPos(point.x, point.y))
+    {
+        diagnostic = Win32Error("Cannot position cursor for click");
         return false;
     }
 
-    POINT screenPoint{};
-    if (!GetScreenPointForEmulator(
-        renderWindow,
-        x,
-        y,
-        screenPoint,
-        diagnostic))
+    if (holdMs > 28)
+        Sleep(35);
+
+    POINT current{};
+    if (IsAutomationCancelled() || !GetCursorPos(&current) || current.x != point.x ||
+        current.y != point.y || !IsPointOnEmulator(topLevelWindow, renderWindow, current))
     {
-        diagnostic = "Login coordinate conversion failed: " + diagnostic;
+        diagnostic = "Click cancelled. The cursor or LDPlayer window changed before input.";
         return false;
     }
 
-    if (!SetCursorPos(screenPoint.x, screenPoint.y))
+    if (legacyClick)
     {
-        diagnostic =
-            "Login cursor positioning failed. Win32 error: " +
-            std::to_string(GetLastError());
-        return false;
-    }
-
-    Sleep(35);
-
-    HWND pointWindow = WindowFromPoint(screenPoint);
-    HWND pointRoot = pointWindow
-        ? GetAncestor(pointWindow, GA_ROOT)
-        : nullptr;
-    HWND pointRootOwner = pointWindow
-        ? GetAncestor(pointWindow, GA_ROOTOWNER)
-        : nullptr;
-
-    if (pointRoot != topLevelWindow &&
-        pointRootOwner != topLevelWindow &&
-        pointWindow != topLevelWindow)
-    {
-        diagnostic =
-            "Login click cancelled: another window covers the login button. "
-            "Move the emulator windows so the login button is visible.";
-        return false;
-    }
-
-    if (attempt <= 1)
-    {
-        // Primary path: a normal SendInput down/up with a longer hold.
-        INPUT move{};
-        move.type = INPUT_MOUSE;
-        move.mi.dx = static_cast<LONG>(
-            (static_cast<long long>(
-                screenPoint.x - GetSystemMetrics(SM_XVIRTUALSCREEN)) * 65535) /
-            std::max(1, GetSystemMetrics(SM_CXVIRTUALSCREEN) - 1)
-        );
-        move.mi.dy = static_cast<LONG>(
-            (static_cast<long long>(
-                screenPoint.y - GetSystemMetrics(SM_YVIRTUALSCREEN)) * 65535) /
-            std::max(1, GetSystemMetrics(SM_CYVIRTUALSCREEN) - 1)
-        );
-        move.mi.dx = std::clamp<LONG>(move.mi.dx, 0, 65535);
-        move.mi.dy = std::clamp<LONG>(move.mi.dy, 0, 65535);
-        move.mi.dwFlags =
-            MOUSEEVENTF_MOVE |
-            MOUSEEVENTF_ABSOLUTE |
-            MOUSEEVENTF_VIRTUALDESK;
-
-        if (SendInput(1, &move, sizeof(INPUT)) != 1)
-        {
-            diagnostic =
-                "Login SendInput mouse move failed. Win32 error: " +
-                std::to_string(GetLastError());
-            return false;
-        }
-
-        INPUT down{};
-        down.type = INPUT_MOUSE;
-        down.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
-
-        INPUT up{};
-        up.type = INPUT_MOUSE;
-        up.mi.dwFlags = MOUSEEVENTF_LEFTUP;
-
-        if (SendInput(1, &down, sizeof(INPUT)) != 1)
-        {
-            diagnostic =
-                "Login SendInput left-down failed. Win32 error: " +
-                std::to_string(GetLastError());
-            return false;
-        }
-
-        Sleep(85);
-
-        if (SendInput(1, &up, sizeof(INPUT)) != 1)
-        {
-            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
-            diagnostic =
-                "Login SendInput left-up failed. Win32 error: " +
-                std::to_string(GetLastError());
-            return false;
-        }
-
-        diagnostic =
-            "LOGIN CLICK: primary SendInput mouse press, 85 ms hold, "
-            "game=(" + std::to_string(x) + "," + std::to_string(y) +
-            "), desktop=(" + std::to_string(screenPoint.x) + "," +
-            std::to_string(screenPoint.y) + ").";
-        return true;
-    }
-
-    // Fallback path: the legacy Win32 mouse_event API, not ADB or a
-    // window-message simulation. It produces a separate desktop mouse click.
-    mouse_event(MOUSEEVENTF_MOVE, 0, 0, 0, 0);
-    mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
-    Sleep(95);
-    mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
-
-    diagnostic =
-        "LOGIN CLICK: fallback Win32 mouse_event press, 95 ms hold, "
-        "game=(" + std::to_string(x) + "," + std::to_string(y) +
-        "), desktop=(" + std::to_string(screenPoint.x) + "," +
-        std::to_string(screenPoint.y) + ").";
-
-    return true;
-}
-
-bool TapADB(
-    const std::string& deviceId,
-    int x,
-    int y,
-    std::string& diagnostic)
-{
-    if (x < 0 || x >= SCREEN_WIDTH ||
-        y < 0 || y >= SCREEN_HEIGHT)
-    {
-        diagnostic = "Invalid tap coordinates.";
-        return false;
-    }
-
-    HWND topLevelWindow = nullptr;
-    HWND renderWindow = nullptr;
-
-    if (!ActivateEmulatorWindow(
-        deviceId,
-        topLevelWindow,
-        renderWindow,
-        diagnostic))
-    {
-        return false;
-    }
-
-    POINT screenPoint{};
-    if (!GetScreenPointForEmulator(
-        renderWindow,
-        x,
-        y,
-        screenPoint,
-        diagnostic))
-    {
-        return false;
-    }
-
-    // Convert to virtual-desktop absolute coordinates. This is more reliable
-    // on multi-monitor / multi-window desktops than a move followed by clicks.
-    const int virtualLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    const int virtualTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    const int virtualWidth = std::max(1, GetSystemMetrics(SM_CXVIRTUALSCREEN));
-    const int virtualHeight = std::max(1, GetSystemMetrics(SM_CYVIRTUALSCREEN));
-
-    LONG absoluteX = static_cast<LONG>(
-        (static_cast<long long>(screenPoint.x - virtualLeft) * 65535) /
-        std::max(1, virtualWidth - 1)
-    );
-
-    LONG absoluteY = static_cast<LONG>(
-        (static_cast<long long>(screenPoint.y - virtualTop) * 65535) /
-        std::max(1, virtualHeight - 1)
-    );
-
-    absoluteX = std::clamp<LONG>(absoluteX, 0, 65535);
-    absoluteY = std::clamp<LONG>(absoluteY, 0, 65535);
-
-    if (!SetCursorPos(screenPoint.x, screenPoint.y))
-    {
-        diagnostic =
-            "SetCursorPos failed. Win32 error: " +
-            std::to_string(GetLastError());
-        return false;
-    }
-
-    // Verify the target is actually under the pointer. This catches overlapping
-    // emulator windows and stale HWND mappings before the click is sent.
-    HWND windowUnderPoint = WindowFromPoint(screenPoint);
-    HWND underRoot = windowUnderPoint
-        ? GetAncestor(windowUnderPoint, GA_ROOT)
-        : nullptr;
-    HWND underRootOwner = windowUnderPoint
-        ? GetAncestor(windowUnderPoint, GA_ROOTOWNER)
-        : nullptr;
-
-    if (underRoot != topLevelWindow &&
-        underRootOwner != topLevelWindow &&
-        windowUnderPoint != topLevelWindow)
-    {
-        // Raise the mapped LDPlayer once more, then re-check.
-        SetWindowPos(
-            topLevelWindow,
-            HWND_TOP,
-            0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
-        );
-        BringWindowToTop(topLevelWindow);
-        SetForegroundWindow(topLevelWindow);
-        Sleep(15);
-
-        SetCursorPos(screenPoint.x, screenPoint.y);
-        windowUnderPoint = WindowFromPoint(screenPoint);
-        underRoot = windowUnderPoint
-            ? GetAncestor(windowUnderPoint, GA_ROOT)
-            : nullptr;
-        underRootOwner = windowUnderPoint
-            ? GetAncestor(windowUnderPoint, GA_ROOTOWNER)
-            : nullptr;
-    }
-
-    if (underRoot != topLevelWindow &&
-        underRootOwner != topLevelWindow &&
-        windowUnderPoint != topLevelWindow)
-    {
-        wchar_t className[128]{};
-        if (windowUnderPoint)
-            GetClassNameW(windowUnderPoint, className, 128);
-
-        diagnostic =
-            "Click cancelled: another window covers the target point. "
-            "Covered HWND=" +
-            std::to_string(reinterpret_cast<uintptr_t>(windowUnderPoint)) +
-            ", class=" + WideToUtf8(className) +
-            ". Move LDPlayer windows so the target area is not covered.";
-        return false;
-    }
-
-    // Use a real absolute mouse-move event and then a short down/up pair.
-    INPUT move{};
-    move.type = INPUT_MOUSE;
-    move.mi.dx = absoluteX;
-    move.mi.dy = absoluteY;
-    move.mi.dwFlags =
-        MOUSEEVENTF_MOVE |
-        MOUSEEVENTF_ABSOLUTE |
-        MOUSEEVENTF_VIRTUALDESK;
-
-    if (SendInput(1, &move, sizeof(INPUT)) != 1)
-    {
-        diagnostic =
-            "SendInput mouse move failed. Win32 error: " +
-            std::to_string(GetLastError());
-        return false;
-    }
-
-    INPUT down{};
-    down.type = INPUT_MOUSE;
-    down.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
-
-    INPUT up{};
-    up.type = INPUT_MOUSE;
-    up.mi.dwFlags = MOUSEEVENTF_LEFTUP;
-
-    if (SendInput(1, &down, sizeof(INPUT)) != 1)
-    {
-        diagnostic =
-            "Mouse left-down failed. Win32 error: " +
-            std::to_string(GetLastError());
-        return false;
-    }
-
-    Sleep(28);
-
-    if (SendInput(1, &up, sizeof(INPUT)) != 1)
-    {
-        // Avoid leaving the physical left button logically held.
+        mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+        Sleep(holdMs);
         mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+    }
+    else
+    {
+        INPUT button{};
+        button.type = INPUT_MOUSE;
+        button.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+        if (SendInput(1, &button, sizeof(INPUT)) != 1)
+        {
+            diagnostic = Win32Error("Cannot press left mouse button");
+            return false;
+        }
 
-        diagnostic =
-            "Mouse left-up failed. Win32 error: " +
-            std::to_string(GetLastError());
-        return false;
+        Sleep(holdMs);
+
+        button.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+        if (SendInput(1, &button, sizeof(INPUT)) != 1)
+        {
+            diagnostic = Win32Error("Cannot release left mouse button");
+            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+            return false;
+        }
     }
 
-    diagnostic =
-        "REAL WINDOWS MOUSE CLICK at game coordinates (" +
-        std::to_string(x) + ", " + std::to_string(y) +
-        "), desktop coordinates (" +
-        std::to_string(screenPoint.x) + ", " +
-        std::to_string(screenPoint.y) +
-        "); unobstructed target HWND confirmed.";
-
+    diagnostic = "Mouse click at game (" + std::to_string(x) + ", " + std::to_string(y) +
+        "), desktop (" + std::to_string(point.x) + ", " + std::to_string(point.y) + ").";
     return true;
 }
 
-bool SendBackspaceADB(
-    const std::string& deviceId,
-    int count,
-    std::string& diagnostic)
+bool TapLoginButton(const std::string& deviceId, int x, int y, int attempt, std::string& diagnostic)
 {
-    if (count < 1)
-        count = 1;
+    return ClickEmulator(deviceId, x, y, attempt == 1 ? 85 : 95, attempt > 1, diagnostic);
+}
 
-    HWND topLevelWindow = nullptr;
-    HWND renderWindow = nullptr;
+bool TapADB(const std::string& deviceId, int x, int y, std::string& diagnostic)
+{
+    return ClickEmulator(deviceId, x, y, 28, false, diagnostic);
+}
 
-    if (!ActivateEmulatorWindow(
-        deviceId,
-        topLevelWindow,
-        renderWindow,
-        diagnostic))
+bool ConfirmKeyboardTarget(const std::string& deviceId, std::string& diagnostic)
+{
+    if (IsAutomationCancelled())
     {
+        diagnostic = "Keyboard input cancelled.";
         return false;
     }
 
-    // Move caret to the end, then send exactly the requested Backspace count.
-    if (!SendVirtualKey(VK_END, diagnostic))
-        return false;
-
-    Sleep(25);
-
-    for (int i = 0; i < count; ++i)
+    const HWND window = GetMappedEmulatorWindow(deviceId);
+    if (!IsForegroundEmulator(window))
     {
-        if (!SendVirtualKey(VK_BACK, diagnostic))
-            return false;
-
-        Sleep(8);
+        diagnostic = "Keyboard input cancelled. The assigned LDPlayer window lost focus.";
+        return false;
     }
 
-    diagnostic =
-        "REAL WINDOWS KEYBOARD: End + " +
-        std::to_string(count) +
-        " Backspace key presses.";
-
+    GUITHREADINFO info{};
+    info.cbSize = sizeof(info);
+    if (!GetGUIThreadInfo(0, &info) || !info.hwndFocus ||
+        GetAncestor(info.hwndFocus, GA_ROOT) != window)
+    {
+        diagnostic = "Keyboard input cancelled. Focus is outside the assigned LDPlayer window.";
+        return false;
+    }
     return true;
+}
+
+bool SendKeyboardBatch(INPUT* events, UINT count, std::string& diagnostic)
+{
+    const UINT sent = SendInput(count, events, sizeof(INPUT));
+    if (sent == count)
+        return true;
+
+    diagnostic = Win32Error("Cannot send keyboard input");
+    for (UINT i = sent; i < count; ++i)
+    {
+        if (!(events[i].ki.dwFlags & KEYEVENTF_KEYUP))
+            continue;
+
+        for (UINT j = 0; j < sent; ++j)
+        {
+            if (events[j].ki.wVk == events[i].ki.wVk && events[j].ki.wScan == events[i].ki.wScan &&
+                !(events[j].ki.dwFlags & KEYEVENTF_KEYUP))
+            {
+                SendInput(1, &events[i], sizeof(INPUT));
+                break;
+            }
+        }
+    }
+    return false;
+}
+
+INPUT KeyEvent(WORD virtualKey, bool keyUp = false)
+{
+    INPUT event{};
+    event.type = INPUT_KEYBOARD;
+    event.ki.wVk = virtualKey;
+    if (keyUp)
+        event.ki.dwFlags = KEYEVENTF_KEYUP;
+    return event;
+}
+
+bool SendHeldKey(WORD virtualKey, DWORD holdMs, std::string& diagnostic)
+{
+    INPUT down = KeyEvent(virtualKey);
+    if (!SendKeyboardBatch(&down, 1, diagnostic))
+        return false;
+
+    Sleep(holdMs);
+
+    INPUT up = KeyEvent(virtualKey, true);
+    if (SendKeyboardBatch(&up, 1, diagnostic))
+        return true;
+
+    SendInput(1, &up, sizeof(INPUT));
+    return false;
 }
 
 bool ClearADBTextField(
@@ -1156,152 +1107,31 @@ bool ClearADBTextField(
     int y,
     std::string& diagnostic)
 {
-    std::string tapDiagnostic;
-
-    if (!TapADB(deviceId, x, y, tapDiagnostic))
-    {
-        diagnostic = "Field tap failed: " + tapDiagnostic;
+    if (!TapADB(deviceId, x, y, diagnostic))
         return false;
-    }
 
-    // Do not call ActivateEmulatorWindow again here: the click has just
-    // focused the actual input widget. Re-activating the render HWND could
-    // steal focus from a WebView/game text field on secondary emulators.
     Sleep(25);
-
-    std::vector<INPUT> selectAllEvents;
-
-    auto appendVk = [](std::vector<INPUT>& events, WORD key, bool keyUp)
-    {
-        INPUT event{};
-        event.type = INPUT_KEYBOARD;
-        event.ki.wVk = key;
-
-        if (keyUp)
-            event.ki.dwFlags = KEYEVENTF_KEYUP;
-
-        events.push_back(event);
-    };
-
-    // Ctrl+A, then Backspace, sent as one ordered Windows input batch.
-    appendVk(selectAllEvents, VK_CONTROL, false);
-    appendVk(selectAllEvents, 'A', false);
-    appendVk(selectAllEvents, 'A', true);
-    appendVk(selectAllEvents, VK_CONTROL, true);
-    const UINT selectAllSent = SendInput(
-        static_cast<UINT>(selectAllEvents.size()),
-        selectAllEvents.data(),
-        sizeof(INPUT)
-    );
-
-    if (selectAllSent != selectAllEvents.size())
-    {
-        // Recover modifier state in case Windows accepted only part of the batch.
-        INPUT releaseModifiers[2]{};
-        releaseModifiers[0].type = INPUT_KEYBOARD;
-        releaseModifiers[0].ki.wVk = VK_CONTROL;
-        releaseModifiers[0].ki.dwFlags = KEYEVENTF_KEYUP;
-        releaseModifiers[1].type = INPUT_KEYBOARD;
-        releaseModifiers[1].ki.wVk = 'A';
-        releaseModifiers[1].ki.dwFlags = KEYEVENTF_KEYUP;
-        SendInput(2, releaseModifiers, sizeof(INPUT));
-
-        diagnostic =
-            "Ctrl+A clear sequence failed. Win32 error: " +
-            std::to_string(GetLastError());
+    INPUT selectAll[] = { KeyEvent(VK_CONTROL), KeyEvent('A'), KeyEvent('A', true), KeyEvent(VK_CONTROL, true) };
+    if (!ConfirmKeyboardTarget(deviceId, diagnostic) || !SendKeyboardBatch(selectAll, 4, diagnostic))
         return false;
-    }
 
-    // Give the first Backspace a real hold instead of an instantaneous
-    // down/up pair; some game text controls ignore very short key taps.
-    INPUT initialBackspaceDown{};
-    initialBackspaceDown.type = INPUT_KEYBOARD;
-    initialBackspaceDown.ki.wVk = VK_BACK;
-
-    if (SendInput(1, &initialBackspaceDown, sizeof(INPUT)) != 1)
-    {
-        diagnostic =
-            "Initial Backspace key-down failed. Win32 error: " +
-            std::to_string(GetLastError());
+    if (!ConfirmKeyboardTarget(deviceId, diagnostic) || !SendHeldKey(VK_BACK, 35, diagnostic))
         return false;
-    }
-
-    Sleep(35);
-
-    INPUT initialBackspaceUp{};
-    initialBackspaceUp.type = INPUT_KEYBOARD;
-    initialBackspaceUp.ki.wVk = VK_BACK;
-    initialBackspaceUp.ki.dwFlags = KEYEVENTF_KEYUP;
-
-    if (SendInput(1, &initialBackspaceUp, sizeof(INPUT)) != 1)
-    {
-        diagnostic =
-            "Initial Backspace key-up failed. Win32 error: " +
-            std::to_string(GetLastError());
-        return false;
-    }
 
     Sleep(18);
-
-    // Safety pass for fields that ignore Ctrl+A: End + 24 held Backspaces.
-    INPUT endEvents[2]{};
-    endEvents[0].type = INPUT_KEYBOARD;
-    endEvents[0].ki.wVk = VK_END;
-    endEvents[1].type = INPUT_KEYBOARD;
-    endEvents[1].ki.wVk = VK_END;
-    endEvents[1].ki.dwFlags = KEYEVENTF_KEYUP;
-
-    if (SendInput(2, endEvents, sizeof(INPUT)) != 2)
-    {
-        diagnostic =
-            "End key failed during field clear. Win32 error: " +
-            std::to_string(GetLastError());
+    INPUT end[] = { KeyEvent(VK_END), KeyEvent(VK_END, true) };
+    if (!ConfirmKeyboardTarget(deviceId, diagnostic) || !SendKeyboardBatch(end, 2, diagnostic))
         return false;
-    }
 
+    // Some controls ignore Ctrl+A. Keep the existing fallback for short names.
     for (int i = 0; i < 24; ++i)
     {
-        INPUT backspaceEvents[2]{};
-
-        backspaceEvents[0].type = INPUT_KEYBOARD;
-        backspaceEvents[0].ki.wVk = VK_BACK;
-
-        if (SendInput(1, &backspaceEvents[0], sizeof(INPUT)) != 1)
-        {
-            diagnostic =
-                "Backspace key-down failed at key " +
-                std::to_string(i + 1) +
-                ". Win32 error: " +
-                std::to_string(GetLastError());
+        if (!ConfirmKeyboardTarget(deviceId, diagnostic) || !SendHeldKey(VK_BACK, 28, diagnostic))
             return false;
-        }
-
-        // Hold Backspace long enough for slower WebView/game input fields
-        // to process the key reliably, then release before the next press.
-        Sleep(28);
-
-        backspaceEvents[1].type = INPUT_KEYBOARD;
-        backspaceEvents[1].ki.wVk = VK_BACK;
-        backspaceEvents[1].ki.dwFlags = KEYEVENTF_KEYUP;
-
-        if (SendInput(1, &backspaceEvents[1], sizeof(INPUT)) != 1)
-        {
-            diagnostic =
-                "Backspace key-up failed at key " +
-                std::to_string(i + 1) +
-                ". Win32 error: " +
-                std::to_string(GetLastError());
-            return false;
-        }
-
         Sleep(12);
     }
 
-    diagnostic =
-        tapDiagnostic +
-        " REAL KEYBOARD CLEAR: Ctrl+A + Backspace + End + 24 Backspaces "
-        "without changing focus.";
-
+    diagnostic = "Cleared the focused name field.";
     return true;
 }
 
@@ -1314,7 +1144,9 @@ bool IsSafeADBText(const std::string& value)
 
     for (unsigned char c : value)
     {
-        if (!std::isalnum(c))
+        const bool isLetter = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+        const bool isDigit = c >= '0' && c <= '9';
+        if (!isLetter && !isDigit)
             return false;
     }
 
@@ -1324,8 +1156,7 @@ bool IsSafeADBText(const std::string& value)
 bool InputADBText(
     const std::string& deviceId,
     const std::string& value,
-    std::string& diagnostic,
-    bool activateWindow = true)
+    std::string& diagnostic)
 {
     if (!IsSafeADBText(value))
     {
@@ -1335,69 +1166,53 @@ bool InputADBText(
         return false;
     }
 
-    HWND topLevelWindow = nullptr;
-    HWND renderWindow = nullptr;
-
-    if (activateWindow &&
-        !ActivateEmulatorWindow(
-            deviceId,
-            topLevelWindow,
-            renderWindow,
-            diagnostic))
-    {
+    if (!ConfirmKeyboardTarget(deviceId, diagnostic))
         return false;
-    }
 
+    const HKL layout = GetKeyboardLayout(GetWindowThreadProcessId(GetMappedEmulatorWindow(deviceId), nullptr));
     const std::wstring text = Utf8ToWide(value);
 
-    // Use keyboard scan codes, not clipboard paste or ADB text injection.
-    // These are ordinary key-down/key-up events delivered to LDPlayer.
-    for (wchar_t ch : text)
+    // Validate the full string before pressing any key.
+    std::vector<SHORT> mappings;
+    mappings.reserve(text.size());
+    for (wchar_t character : text)
     {
-        const SHORT keyMapping = VkKeyScanW(ch);
-
-        if (keyMapping == -1)
+        const SHORT mapping = VkKeyScanExW(character, layout);
+        if (mapping == -1 || (HIBYTE(mapping) & ~7) != 0)
         {
-            diagnostic =
-                "The current Windows keyboard layout cannot map character: " +
-                std::to_string(static_cast<unsigned int>(ch));
+            diagnostic = "Switch the LDPlayer window to an English keyboard layout before starting automation.";
             return false;
         }
+        mappings.push_back(mapping);
+    }
 
-        const WORD virtualKey = LOBYTE(keyMapping);
-        const BYTE modifiers = HIBYTE(keyMapping);
+    for (SHORT mapping : mappings)
+    {
+        if (!ConfirmKeyboardTarget(deviceId, diagnostic))
+            return false;
 
-        std::vector<INPUT> events;
-
-        auto appendScanCode = [&events](WORD vk, bool keyUp)
-        {
-            UINT scanCode = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
-
-            INPUT event{};
-            event.type = INPUT_KEYBOARD;
-            event.ki.wVk = 0;
-            event.ki.wScan = static_cast<WORD>(scanCode & 0xFF);
-            event.ki.dwFlags = KEYEVENTF_SCANCODE;
-
-            if ((scanCode & 0xFF00) != 0)
-                event.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
-
-            if (keyUp)
-                event.ki.dwFlags |= KEYEVENTF_KEYUP;
-
-            events.push_back(event);
-        };
-
+        const WORD virtualKey = LOBYTE(mapping);
+        const BYTE modifiers = HIBYTE(mapping);
         bool needShift = (modifiers & 1) != 0;
         const bool needControl = (modifiers & 2) != 0;
         const bool needAlt = (modifiers & 4) != 0;
-
-        // Respect the current Caps Lock state for alphabetic characters.
-        if ((virtualKey >= 'A' && virtualKey <= 'Z') &&
-            (GetKeyState(VK_CAPITAL) & 1))
-        {
+        if (virtualKey >= 'A' && virtualKey <= 'Z' && (GetKeyState(VK_CAPITAL) & 1))
             needShift = !needShift;
-        }
+
+        std::array<INPUT, 8> events{};
+        UINT count = 0;
+        const auto appendScanCode = [&](WORD key, bool keyUp)
+        {
+            const UINT scanCode = MapVirtualKeyExW(key, MAPVK_VK_TO_VSC_EX, layout);
+            INPUT& event = events[count++];
+            event.type = INPUT_KEYBOARD;
+            event.ki.wScan = static_cast<WORD>(scanCode & 0xFF);
+            event.ki.dwFlags = KEYEVENTF_SCANCODE;
+            if ((scanCode & 0xFF00) == 0xE000)
+                event.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+            if (keyUp)
+                event.ki.dwFlags |= KEYEVENTF_KEYUP;
+        };
 
         if (needControl)
             appendScanCode(VK_CONTROL, false);
@@ -1416,21 +1231,23 @@ bool InputADBText(
         if (needControl)
             appendScanCode(VK_CONTROL, true);
 
-        const UINT sent = SendInput(
-            static_cast<UINT>(events.size()),
-            events.data(),
-            sizeof(INPUT)
-        );
-
-        if (sent != events.size())
+        for (UINT i = 0; i < count; ++i)
         {
-            diagnostic =
-                "Physical-style scan-code input failed. Win32 error: " +
-                std::to_string(GetLastError());
-            return false;
+            if (events[i].ki.wScan == 0)
+            {
+                diagnostic = "The LDPlayer keyboard layout has an unsupported scan code.";
+                return false;
+            }
         }
 
-        Sleep(75);
+        if (!SendKeyboardBatch(events.data(), count, diagnostic))
+            return false;
+
+        if (!PauseAutomation(75))
+        {
+            diagnostic = "Keyboard input cancelled.";
+            return false;
+        }
     }
 
     diagnostic =
@@ -1441,124 +1258,57 @@ bool InputADBText(
     return true;
 }
 
-bool VerifyEnteredNamesADB(
-    const std::string& deviceId,
-    const std::string& firstName,
-    const std::string& lastName,
-    std::string& diagnostic)
-{
-    std::wstring arguments =
-        L"-s " + DeviceArgument(deviceId) +
-        L" shell \"uiautomator dump "
-        L"/sdcard/smartclick_ui.xml "
-        L">/dev/null 2>&1 && "
-        L"cat /sdcard/smartclick_ui.xml\"";
-
-    std::string output = ExecuteADB(arguments, 20000);
-
-    if (IsADBError(output))
-    {
-        diagnostic =
-            "UI Automator failed: " + output;
-
-        return false;
-    }
-
-    if (output.find(firstName) == std::string::npos)
-    {
-        diagnostic =
-            "Verification failed: generated first name "
-            "was not found in Android UI.";
-
-        return false;
-    }
-
-    if (output.find(lastName) == std::string::npos)
-    {
-        diagnostic =
-            "Verification failed: generated surname "
-            "was not found in Android UI.";
-
-        return false;
-    }
-
-    diagnostic =
-        "VERIFIED: both generated names are present "
-        "in Android UI.";
-
-    return true;
-}
-
 // ============================================================
 // FILE PATHS
 // ============================================================
 
-std::wstring GetExecutableDirectory()
-{
-    wchar_t buffer[MAX_PATH]{};
-
-    DWORD length = GetModuleFileNameW(
-        nullptr,
-        buffer,
-        MAX_PATH
-    );
-
-    if (length == 0 || length >= MAX_PATH)
-        return L".";
-
-    std::wstring path(buffer, length);
-
-    size_t position = path.find_last_of(L"\\/");
-
-    if (position != std::wstring::npos)
-        path.resize(position);
-
-    return path;
-}
-
 std::wstring GetTemplatePath(const std::wstring& filename)
 {
-    return GetExecutableDirectory() + L"\\" + filename;
+    std::wstring executable(32768, L'\0');
+    const DWORD length = GetModuleFileNameW(
+        nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+    if (!length || length >= executable.size())
+        return {};
+
+    executable.resize(length);
+    const size_t separator = executable.find_last_of(L"\\/");
+    if (separator == std::wstring::npos)
+        return {};
+
+    executable.resize(separator + 1);
+    return executable + filename;
 }
 
 // ============================================================
 // GENERATED NAMES FILE
 // ============================================================
 
+std::wstring GetNamesHistoryPath()
+{
+    wchar_t desktop[MAX_PATH]{};
+    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_DESKTOPDIRECTORY, nullptr, SHGFP_TYPE_CURRENT, desktop)))
+        return {};
+
+    return std::wstring(desktop) + L"\\SmartClick_Names.txt";
+}
+
 bool SaveGeneratedName(
-    const std::string& deviceId,
     const std::string& firstName,
     const std::string& lastName,
-    const std::string& password,
     std::string& diagnostic)
 {
-    wchar_t desktopPath[MAX_PATH]{};
-
-    HRESULT result = SHGetFolderPathW(
-        nullptr,
-        CSIDL_DESKTOPDIRECTORY,
-        nullptr,
-        SHGFP_TYPE_CURRENT,
-        desktopPath
-    );
-
-    if (FAILED(result))
+    const std::wstring filePath = GetNamesHistoryPath();
+    if (filePath.empty())
     {
         diagnostic = "Cannot get Windows Desktop path.";
         return false;
     }
 
-    std::wstring filePath =
-        std::wstring(desktopPath) +
-        L"\\SmartClick_Names.txt";
-
-    std::string line =
-        "login - \"" + firstName + "_" + lastName +
-        "\", password - \"" + password + "\"\r\n";
+    const std::string line = "login - \"" + firstName + "_" + lastName + "\"\r\n";
 
     std::lock_guard<std::mutex> lock(g_NamesFileMutex);
 
-    HANDLE file = CreateFileW(
+    const UniqueHandle file(CreateFileW(
         filePath.c_str(),
         FILE_APPEND_DATA,
         FILE_SHARE_READ,
@@ -1566,9 +1316,9 @@ bool SaveGeneratedName(
         OPEN_ALWAYS,
         FILE_ATTRIBUTE_NORMAL,
         nullptr
-    );
+    ));
 
-    if (file == INVALID_HANDLE_VALUE)
+    if (file.get() == INVALID_HANDLE_VALUE)
     {
         diagnostic = "Cannot create or open SmartClick_Names.txt.";
         return false;
@@ -1577,14 +1327,12 @@ bool SaveGeneratedName(
     DWORD bytesWritten = 0;
 
     BOOL written = WriteFile(
-        file,
+        file.get(),
         line.data(),
         static_cast<DWORD>(line.size()),
         &bytesWritten,
         nullptr
     );
-
-    CloseHandle(file);
 
     if (!written || bytesWritten != line.size())
     {
@@ -1607,7 +1355,7 @@ bool ReadBinaryFile(
 {
     data.clear();
 
-    HANDLE file = CreateFileW(
+    const UniqueHandle file(CreateFileW(
         path.c_str(),
         GENERIC_READ,
         FILE_SHARE_READ,
@@ -1615,9 +1363,9 @@ bool ReadBinaryFile(
         OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL,
         nullptr
-    );
+    ));
 
-    if (file == INVALID_HANDLE_VALUE)
+    if (file.get() == INVALID_HANDLE_VALUE)
     {
         diagnostic =
             "Cannot open file: " +
@@ -1628,12 +1376,11 @@ bool ReadBinaryFile(
 
     LARGE_INTEGER fileSize{};
 
-    if (!GetFileSizeEx(file, &fileSize) ||
+    if (!GetFileSizeEx(file.get(), &fileSize) ||
         fileSize.QuadPart <= 0 ||
         fileSize.QuadPart > 100 * 1024 * 1024)
     {
         diagnostic = "Invalid template file size.";
-        CloseHandle(file);
         return false;
     }
 
@@ -1653,7 +1400,7 @@ bool ReadBinaryFile(
         DWORD bytesRead = 0;
 
         if (!ReadFile(
-            file,
+            file.get(),
             data.data() + totalRead,
             requested,
             &bytesRead,
@@ -1661,14 +1408,12 @@ bool ReadBinaryFile(
         {
             diagnostic = "Cannot read complete file.";
             data.clear();
-            CloseHandle(file);
             return false;
         }
 
         totalRead += bytesRead;
     }
 
-    CloseHandle(file);
     return true;
 }
 
@@ -1676,11 +1421,20 @@ bool ReadBinaryFile(
 // TEMPLATE LOADING
 // ============================================================
 
+bool TemplateHasContrast(const cv::Mat& image)
+{
+    cv::Scalar mean;
+    cv::Scalar deviation;
+    cv::meanStdDev(image, mean, deviation);
+    return deviation[0] > 0.0 || deviation[1] > 0.0 || deviation[2] > 0.0;
+}
+
 bool LoadPhotonTemplate(
     const std::wstring& path,
     cv::Mat& destination,
     std::string& diagnostic)
 {
+    destination.release();
     std::vector<unsigned char> data;
 
     if (!ReadBinaryFile(path, data, diagnostic))
@@ -1713,13 +1467,19 @@ bool LoadPhotonTemplate(
             return false;
         }
 
-        destination = decoded.clone();
+        if (!TemplateHasContrast(decoded))
+        {
+            diagnostic = "Template has no contrast: " + WideToUtf8(path);
+            return false;
+        }
+
+        destination = std::move(decoded);
 
         diagnostic =
             "Loaded " + WideToUtf8(path) +
             " (" +
-            std::to_string(decoded.cols) + "x" +
-            std::to_string(decoded.rows) + ")";
+            std::to_string(destination.cols) + "x" +
+            std::to_string(destination.rows) + ")";
 
         return true;
     }
@@ -1746,32 +1506,19 @@ bool LoadPhotonTemplates()
 
     diagnostic.clear();
 
-    bool after = LoadPhotonTemplate(
+    LoadPhotonTemplate(
         GetTemplatePath(L"photon_after_login.png"),
         g_PhotonAfterLoginTemplate,
         diagnostic
     );
 
-    status << "photon_after_login.png: " << diagnostic << "\n";
-
-    const std::array<std::string, 9> names =
-    {
-        "play",
-        "password",
-        "password_repeat",
-        "register",
-        "skip",
-        "next",
-        "start",
-        "enter_name",
-        "enter_lastname"
-    };
+    status << "photon_after_login.png (optional): " << diagnostic << "\n";
 
     g_StageTemplates.clear();
 
     bool allStageTemplates = true;
 
-    for (const std::string& name : names)
+    for (const std::string& name : g_RegistrationTemplates)
     {
         cv::Mat image;
         std::string fileDiagnostic;
@@ -1795,7 +1542,7 @@ bool LoadPhotonTemplates()
             allStageTemplates = false;
     }
 
-    g_TemplatesLoaded = ready && after;
+    g_TemplatesLoaded = ready;
 
     status
         << "\nLOGIN TEMPLATES: "
@@ -1812,20 +1559,7 @@ bool LoadPhotonTemplates()
 
 bool AreAllStageTemplatesLoaded()
 {
-    const std::array<std::string, 9> names =
-    {
-        "play",
-        "password",
-        "password_repeat",
-        "register",
-        "skip",
-        "next",
-        "start",
-        "enter_name",
-        "enter_lastname"
-    };
-
-    for (const std::string& name : names)
+    for (const std::string& name : g_RegistrationTemplates)
     {
         auto it = g_StageTemplates.find(name);
 
@@ -1839,23 +1573,6 @@ bool AreAllStageTemplatesLoaded()
 // ============================================================
 // SCREENSHOT CAPTURE
 // ============================================================
-
-bool CaptureADBScreenshot(
-    const std::string& deviceId,
-    std::vector<unsigned char>& imageData)
-{
-    std::wstring arguments =
-        L"-s " + DeviceArgument(deviceId) +
-        L" exec-out screencap -p";
-
-    return RunProcess(
-        ADB_PATH,
-        arguments,
-        imageData,
-        12000,
-        false
-    );
-}
 
 bool DecodeImage(
     const std::vector<unsigned char>& data,
@@ -1883,12 +1600,19 @@ bool DecodeImage(
         if (image.cols != SCREEN_WIDTH ||
             image.rows != SCREEN_HEIGHT)
         {
-            diagnostic =
-                "Unexpected screenshot resolution: " +
-                std::to_string(image.cols) + "x" +
-                std::to_string(image.rows);
+            const bool supported = image.cols >= 320 &&
+                static_cast<long long>(image.cols) * SCREEN_HEIGHT ==
+                static_cast<long long>(image.rows) * SCREEN_WIDTH;
+            if (!supported)
+            {
+                diagnostic = "Expected a landscape 16:9 screenshot, got " +
+                    std::to_string(image.cols) + "x" + std::to_string(image.rows) + ".";
+                image.release();
+                return false;
+            }
 
-            return false;
+            const int interpolation = image.cols > SCREEN_WIDTH ? cv::INTER_AREA : cv::INTER_LINEAR;
+            cv::resize(image, image, cv::Size(SCREEN_WIDTH, SCREEN_HEIGHT), 0.0, 0.0, interpolation);
         }
 
         return true;
@@ -1900,6 +1624,26 @@ bool DecodeImage(
     }
 }
 
+bool CaptureADBScreenshot(
+    const std::string& deviceId,
+    cv::Mat& screen,
+    std::string& diagnostic,
+    ULONGLONG deadline)
+{
+    constexpr DWORD maxCaptureMs = 4000;
+    const DWORD timeout = std::min(maxCaptureMs, RemainingTime(deadline));
+    if (!timeout)
+    {
+        diagnostic = "Screenshot deadline expired.";
+        return false;
+    }
+
+    std::vector<unsigned char> imageData;
+    const std::wstring arguments = L"-s " + DeviceArgument(deviceId) + L" exec-out screencap -p";
+    return RunProcess(ADBExecutable(), arguments, imageData, diagnostic, timeout, false, true) &&
+        DecodeImage(imageData, screen, diagnostic);
+}
+
 // ============================================================
 // IMAGE RECOGNITION
 // ============================================================
@@ -1909,7 +1653,8 @@ bool DetectPhotonTemplate(
     const cv::Mat& templateImage,
     double& confidence,
     POINT& matchCenter,
-    std::string& diagnostic)
+    std::string& diagnostic,
+    ULONGLONG deadline)
 {
     confidence = 0.0;
     matchCenter = { 0, 0 };
@@ -1923,23 +1668,9 @@ bool DetectPhotonTemplate(
 
     try
     {
-        std::vector<unsigned char> screenshotData;
-
-        if (!CaptureADBScreenshot(deviceId, screenshotData))
-        {
-            diagnostic = "Screenshot capture failed.";
-            return false;
-        }
-
         cv::Mat screenshot;
-
-        if (!DecodeImage(
-            screenshotData,
-            screenshot,
-            diagnostic))
-        {
+        if (!CaptureADBScreenshot(deviceId, screenshot, diagnostic, deadline))
             return false;
-        }
 
         if (templateImage.cols > screenshot.cols ||
             templateImage.rows > screenshot.rows)
@@ -2013,54 +1744,8 @@ bool DetectPhotonReady(
     std::string& diagnostic)
 {
     return DetectPhotonTemplate(
-        deviceId,
-        g_PhotonReadyTemplate,
-        confidence,
-        center,
-        diagnostic
-    );
-}
-
-bool DetectPhotonAfterLogin(
-    const std::string& deviceId,
-    double& confidence,
-    std::string& diagnostic)
-{
-    POINT center{};
-
-    return DetectPhotonTemplate(
-        deviceId,
-        g_PhotonAfterLoginTemplate,
-        confidence,
-        center,
-        diagnostic
-    );
-}
-
-bool DetectStage(
-    const std::string& deviceId,
-    const std::string& templateName,
-    double& confidence,
-    POINT& center,
-    std::string& diagnostic)
-{
-    auto it = g_StageTemplates.find(templateName);
-
-    if (it == g_StageTemplates.end())
-    {
-        diagnostic =
-            "Template not loaded: " + templateName;
-
-        return false;
-    }
-
-    return DetectPhotonTemplate(
-        deviceId,
-        it->second,
-        confidence,
-        center,
-        diagnostic
-    );
+        deviceId, g_PhotonReadyTemplate, confidence, center, diagnostic,
+        GetTickCount64() + LOGIN_TIMEOUT_MS);
 }
 
 // Field placeholders can vary slightly due to WebView rendering.
@@ -2070,7 +1755,8 @@ bool DetectInputField(
     const std::string& templateName,
     double& confidence,
     POINT& center,
-    std::string& diagnostic)
+    std::string& diagnostic,
+    ULONGLONG deadline)
 {
     confidence = 0.0;
     center = { 0, 0 };
@@ -2082,15 +1768,8 @@ bool DetectInputField(
         return false;
     }
 
-    std::vector<unsigned char> screenshotData;
-    if (!CaptureADBScreenshot(deviceId, screenshotData))
-    {
-        diagnostic = "Screenshot capture failed while searching for " + templateName + ".png";
-        return false;
-    }
-
     cv::Mat screenshot;
-    if (!DecodeImage(screenshotData, screenshot, diagnostic))
+    if (!CaptureADBScreenshot(deviceId, screenshot, diagnostic, deadline))
         return false;
 
     try
@@ -2125,31 +1804,29 @@ bool DetectInputField(
                 scale < 1.0 ? cv::INTER_AREA : cv::INTER_CUBIC
             );
 
+            if (!TemplateHasContrast(scaledTemplate))
+                continue;
+
+            // Restrict the search to candidates with centers inside the form.
+            const int left = std::max(0, 60 - width / 2);
+            const int top = std::max(0, 160 - height / 2);
+            const int right = std::min(screenGray.cols, 420 - width / 2 + width);
+            const int bottom = std::min(screenGray.rows, 420 - height / 2 + height);
+            if (right - left < width || bottom - top < height)
+                continue;
+
+            const cv::Rect searchArea(left, top, right - left, bottom - top);
             cv::Mat matchResult;
-            cv::matchTemplate(
-                screenGray,
-                scaledTemplate,
-                matchResult,
-                cv::TM_CCOEFF_NORMED
-            );
+            cv::matchTemplate(screenGray(searchArea), scaledTemplate, matchResult, cv::TM_CCOEFF_NORMED);
 
-            double minValue = 0.0;
             double maxValue = 0.0;
-            cv::Point minLocation;
             cv::Point maxLocation;
-
-            cv::minMaxLoc(
-                matchResult,
-                &minValue,
-                &maxValue,
-                &minLocation,
-                &maxLocation
-            );
+            cv::minMaxLoc(matchResult, nullptr, &maxValue, nullptr, &maxLocation);
 
             if (std::isfinite(maxValue) && maxValue > bestScore)
             {
                 bestScore = maxValue;
-                bestLocation = maxLocation;
+                bestLocation = maxLocation + searchArea.tl();
                 bestSize = cv::Size(width, height);
             }
         }
@@ -2170,15 +1847,7 @@ bool DetectInputField(
             "% at (" + std::to_string(center.x) +
             ", " + std::to_string(center.y) + ").";
 
-        // The WebView input placeholders are rendered with slightly different
-        // anti-aliasing on different LDPlayer instances. Accept weaker matches
-        // only inside the known registration-form area; WaitForInputField still
-        // requires two consecutive matching frames before clicking.
-        const bool plausibleFieldPosition =
-            center.x >= 60 && center.x <= 420 &&
-            center.y >= 160 && center.y <= 420;
-
-        return plausibleFieldPosition && confidence >= 0.52;
+        return confidence >= 0.52;
     }
     catch (const cv::Exception& e)
     {
@@ -2187,203 +1856,154 @@ bool DetectInputField(
     }
 }
 
+bool MatchesAreStable(POINT previous, POINT current)
+{
+    constexpr LONG maxMovement = 12;
+    return std::abs(previous.x - current.x) <= maxMovement &&
+        std::abs(previous.y - current.y) <= maxMovement;
+}
+
 bool WaitForInputField(
     const std::string& deviceId,
     const std::string& templateName,
     POINT& center,
     std::string& diagnostic,
-    int timeoutMs = 45000)
+    int timeoutMs)
 {
-    const ULONGLONG started = GetTickCount64();
-
-    // WebView placeholders can flicker or shift slightly between ADB frames.
-    // Use a small rolling sample instead of demanding adjacent matching frames.
-    constexpr int SAMPLE_WINDOW = 5;
-    constexpr int REQUIRED_MATCHES = 2;
-
-    int framesInWindow = 0;
-    int matchesInWindow = 0;
-    double confidence = 0.0;
+    const ULONGLONG deadline = GetTickCount64() + timeoutMs;
+    constexpr size_t previousFrameCount = 4;
+    std::array<POINT, previousFrameCount> previousCenters{};
+    std::array<bool, previousFrameCount> previousMatches{};
+    size_t nextIndex = 0;
     double bestConfidence = -1.0;
-    POINT bestCenter{};
-    std::string lastDiagnostic;
     std::string bestDiagnostic;
+    std::string lastDiagnostic;
 
-    while (GetTickCount64() - started < static_cast<ULONGLONG>(timeoutMs))
+    while (!IsAutomationCancelled() && RemainingTime(deadline))
     {
         POINT currentCenter{};
-        std::string currentDiagnostic;
-        double currentConfidence = 0.0;
-
+        double confidence = 0.0;
         const bool found = DetectInputField(
-            deviceId,
-            templateName,
-            currentConfidence,
-            currentCenter,
-            currentDiagnostic
-        );
+            deviceId, templateName, confidence, currentCenter, lastDiagnostic, deadline);
 
-        ++framesInWindow;
-        lastDiagnostic = currentDiagnostic;
-
-        if (found)
+        if (found && !IsAutomationCancelled() && RemainingTime(deadline))
         {
-            ++matchesInWindow;
-
-            if (currentConfidence > bestConfidence)
+            for (size_t index = 0; index < previousFrameCount; ++index)
             {
-                bestConfidence = currentConfidence;
-                bestCenter = currentCenter;
-                bestDiagnostic = currentDiagnostic;
+                if (previousMatches[index] && MatchesAreStable(previousCenters[index], currentCenter))
+                {
+                    center = currentCenter;
+                    diagnostic = "Input field confirmed in two of the last five frames. " + lastDiagnostic;
+                    return true;
+                }
             }
 
-            if (matchesInWindow >= REQUIRED_MATCHES)
+            if (confidence > bestConfidence)
             {
-                center = bestCenter;
-                diagnostic =
-                    "INPUT FIELD CONFIRMED IN " +
-                    std::to_string(REQUIRED_MATCHES) +
-                    " OF " + std::to_string(SAMPLE_WINDOW) +
-                    " FRAMES. Best match: " + bestDiagnostic;
-                return true;
+                bestConfidence = confidence;
+                bestDiagnostic = lastDiagnostic;
             }
         }
 
-        if (framesInWindow >= SAMPLE_WINDOW)
-        {
-            framesInWindow = 0;
-            matchesInWindow = 0;
-        }
-
-        Sleep(100);
+        previousMatches[nextIndex] = found;
+        previousCenters[nextIndex] = currentCenter;
+        nextIndex = (nextIndex + 1) % previousFrameCount;
+        PauseAutomation(std::min<DWORD>(100, RemainingTime(deadline)));
     }
 
-    diagnostic =
-        "TIMEOUT waiting for " + templateName +
-        ".png. Best match during search: " +
-        (bestDiagnostic.empty() ? lastDiagnostic : bestDiagnostic) +
-        ". Last frame: " + lastDiagnostic;
+    if (IsAutomationCancelled())
+        diagnostic = "Cancelled while waiting for " + templateName + ".png.";
+    else
+        diagnostic = "Timeout waiting for " + templateName + ".png. Last frame: " + lastDiagnostic +
+            (bestDiagnostic.empty() ? "" : " Best field match: " + bestDiagnostic);
     return false;
 }
 
-// ============================================================
-// WAIT FOR IMAGE
-// ============================================================
+template <typename Detect>
+bool WaitForTemplate(
+    const std::string& name,
+    int timeoutMs,
+    int requiredMatches,
+    Detect detect,
+    double& confidence,
+    POINT& center,
+    std::string& diagnostic)
+{
+    const ULONGLONG deadline = GetTickCount64() + timeoutMs;
+    POINT previousCenter{};
+    int consecutive = 0;
+    std::string lastDiagnostic;
+    confidence = 0.0;
+    center = {};
+
+    while (!IsAutomationCancelled() && RemainingTime(deadline))
+    {
+        POINT currentCenter{};
+        const bool found = detect(confidence, currentCenter, lastDiagnostic, deadline);
+        if (found && !IsAutomationCancelled() && RemainingTime(deadline))
+        {
+            consecutive = consecutive > 0 && MatchesAreStable(previousCenter, currentCenter)
+                ? consecutive + 1 : 1;
+            previousCenter = currentCenter;
+            if (consecutive == requiredMatches)
+            {
+                center = currentCenter;
+                diagnostic = name + " confirmed. " + lastDiagnostic;
+                return true;
+            }
+        }
+        else
+        {
+            consecutive = 0;
+        }
+
+        PauseAutomation(std::min<DWORD>(DETECTION_INTERVAL_MS, RemainingTime(deadline)));
+    }
+
+    if (IsAutomationCancelled())
+        diagnostic = "Cancelled while waiting for " + name + ".";
+    else
+        diagnostic = "Timeout waiting for " + name + " after " +
+            std::to_string(timeoutMs / 1000) + " seconds. Last result: " + lastDiagnostic;
+    return false;
+}
 
 bool WaitForPhotonReady(
     const std::string& deviceId,
     double& confidence,
     POINT& center,
     std::string& diagnostic,
-    int timeoutMs = LOGIN_TIMEOUT_MS)
+    int timeoutMs)
 {
-    ULONGLONG start = GetTickCount64();
-
-    int attempts = 0;
-    int consecutive = 0;
-
-    std::string lastDiagnostic;
-
-    while (GetTickCount64() - start <
-        static_cast<ULONGLONG>(timeoutMs))
-    {
-        attempts++;
-
-        POINT currentCenter{};
-        std::string currentDiagnostic;
-
-        bool found = DetectPhotonReady(
-            deviceId,
-            confidence,
-            currentCenter,
-            currentDiagnostic
-        );
-
-        lastDiagnostic = currentDiagnostic;
-
-        if (found)
+    return WaitForTemplate("Login screen", timeoutMs, 1,
+        [&](double& score, POINT& point, std::string& last, ULONGLONG deadline)
         {
-            consecutive++;
-            center = currentCenter;
-
-            if (consecutive >= 1)
-            {
-                diagnostic =
-                    "LOGIN SCREEN CONFIRMED. " +
-                    lastDiagnostic;
-
-                return true;
-            }
-        }
-        else
-        {
-            consecutive = 0;
-        }
-
-        Sleep(100);
-    }
-
-    diagnostic =
-        "LOGIN SCREEN TIMEOUT. Last result: " +
-        lastDiagnostic;
-
-    return false;
+            return DetectPhotonTemplate(deviceId, g_PhotonReadyTemplate, score, point, last, deadline);
+        },
+        confidence, center, diagnostic);
 }
 
 bool WaitForPhotonAfterLogin(
     const std::string& deviceId,
     double& confidence,
     std::string& diagnostic,
-    int timeoutMs = AFTER_LOGIN_TIMEOUT_MS)
+    int timeoutMs)
 {
-    ULONGLONG start = GetTickCount64();
-
-    int consecutive = 0;
-    std::string lastDiagnostic;
-
-    while (GetTickCount64() - start <
-        static_cast<ULONGLONG>(timeoutMs))
+    if (g_PhotonAfterLoginTemplate.empty())
     {
-        std::string currentDiagnostic;
-
-        bool found = DetectPhotonAfterLogin(
-            deviceId,
-            confidence,
-            currentDiagnostic
-        );
-
-        lastDiagnostic = currentDiagnostic;
-
-        if (found)
-        {
-            consecutive++;
-
-            if (consecutive >= 1)
-            {
-                diagnostic =
-                    "AFTER LOGIN SCREEN CONFIRMED. " +
-                    lastDiagnostic;
-
-                return true;
-            }
-        }
-        else
-        {
-            consecutive = 0;
-        }
-
-        Sleep(120);
+        diagnostic = "Optional photon_after_login.png is unavailable.";
+        return false;
     }
 
-    diagnostic =
-        "AFTER LOGIN SCREEN TIMEOUT. " +
-        lastDiagnostic;
-
-    return false;
+    POINT center{};
+    return WaitForTemplate("After-login screen", timeoutMs, 1,
+        [&](double& score, POINT& point, std::string& last, ULONGLONG deadline)
+        {
+            return DetectPhotonTemplate(deviceId, g_PhotonAfterLoginTemplate, score, point, last, deadline);
+        },
+        confidence, center, diagnostic);
 }
 
-// Ждёт одно уверенное совпадение конкретного шаблона,
-// чтобы сократить задержку на каждом экране.
 bool WaitForStage(
     const std::string& deviceId,
     const std::string& templateName,
@@ -2391,64 +2011,20 @@ bool WaitForStage(
     std::string& diagnostic,
     int timeoutMs = STAGE_TIMEOUT_MS)
 {
-    ULONGLONG start = GetTickCount64();
-
-    int attempts = 0;
-    int consecutive = 0;
-
-    double confidence = 0.0;
-    std::string lastDiagnostic;
-
-    while (GetTickCount64() - start <
-        static_cast<ULONGLONG>(timeoutMs))
+    const auto stage = g_StageTemplates.find(templateName);
+    if (stage == g_StageTemplates.end())
     {
-        attempts++;
-
-        POINT currentCenter{};
-        std::string currentDiagnostic;
-
-        bool found = DetectStage(
-            deviceId,
-            templateName,
-            confidence,
-            currentCenter,
-            currentDiagnostic
-        );
-
-        lastDiagnostic = currentDiagnostic;
-
-        if (found)
-        {
-            consecutive++;
-            center = currentCenter;
-
-            if (consecutive >= 2)
-            {
-                diagnostic =
-                    templateName +
-                    ".png detected in two consecutive frames. " +
-                    lastDiagnostic;
-
-                return true;
-            }
-        }
-        else
-        {
-            consecutive = 0;
-        }
-
-        Sleep(DETECTION_INTERVAL_MS);
+        diagnostic = "Template not loaded: " + templateName + ".png.";
+        return false;
     }
 
-    diagnostic =
-        "TIMEOUT waiting for " +
-        templateName +
-        ".png after " +
-        std::to_string(timeoutMs / 1000) +
-        " seconds. Last result: " +
-        lastDiagnostic;
-
-    return false;
+    double confidence = 0.0;
+    return WaitForTemplate(templateName + ".png", timeoutMs, 2,
+        [&](double& score, POINT& point, std::string& last, ULONGLONG deadline)
+        {
+            return DetectPhotonTemplate(deviceId, stage->second, score, point, last, deadline);
+        },
+        confidence, center, diagnostic);
 }
 
 bool WaitAndTapStage(
@@ -2509,7 +2085,8 @@ bool DetectPhotonMarkerTemplate(
     const cv::Mat& templateImage,
     double& confidence,
     POINT& matchCenter,
-    std::string& diagnostic)
+    std::string& diagnostic,
+    ULONGLONG deadline)
 {
     confidence = 0.0;
     matchCenter = { 0, 0 };
@@ -2520,15 +2097,8 @@ bool DetectPhotonMarkerTemplate(
         return false;
     }
 
-    std::vector<unsigned char> screenshotData;
-    if (!CaptureADBScreenshot(deviceId, screenshotData))
-    {
-        diagnostic = "PHOTON marker screenshot capture failed.";
-        return false;
-    }
-
     cv::Mat screenshot;
-    if (!DecodeImage(screenshotData, screenshot, diagnostic))
+    if (!CaptureADBScreenshot(deviceId, screenshot, diagnostic, deadline))
         return false;
 
     try
@@ -2552,6 +2122,13 @@ bool DetectPhotonMarkerTemplate(
         cv::Mat templateGray;
         cv::cvtColor(templateImage, templateGray, cv::COLOR_BGR2GRAY);
 
+        cv::Mat hsv;
+        cv::cvtColor(screenRoi, hsv, cv::COLOR_BGR2HSV);
+        cv::Mat purpleMask;
+        cv::inRange(hsv, cv::Scalar(112, 55, 35), cv::Scalar(175, 255, 255), purpleMask);
+        cv::Mat purpleIntegral;
+        cv::integral(purpleMask, purpleIntegral, CV_32S);
+
         const double scales[] =
         {
             0.55, 0.65, 0.75, 0.85, 0.95,
@@ -2559,6 +2136,7 @@ bool DetectPhotonMarkerTemplate(
         };
 
         double bestScore = -1.0;
+        double bestPurpleRatio = 0.0;
         cv::Point bestLocation{};
         cv::Size bestSize{};
 
@@ -2582,61 +2160,48 @@ bool DetectPhotonMarkerTemplate(
                 0.0,
                 scale < 1.0 ? cv::INTER_AREA : cv::INTER_CUBIC);
 
+            if (!TemplateHasContrast(scaledTemplate))
+                continue;
+
+            cv::Mat validPositions(screenGray.rows - height + 1, screenGray.cols - width + 1, CV_8U);
+            const int minPurpleSum = static_cast<int>(std::ceil(0.035 * width * height * 255));
+            for (int y = 0; y < validPositions.rows; ++y)
+            {
+                const int* top = purpleIntegral.ptr<int>(y);
+                const int* bottom = purpleIntegral.ptr<int>(y + height);
+                unsigned char* valid = validPositions.ptr<unsigned char>(y);
+                for (int x = 0; x < validPositions.cols; ++x)
+                    valid[x] = bottom[x + width] - top[x + width] - bottom[x] + top[x] >= minPurpleSum;
+            }
+            if (!cv::countNonZero(validPositions))
+                continue;
+
             cv::Mat matchResult;
-            cv::matchTemplate(
-                screenGray,
-                scaledTemplate,
-                matchResult,
-                cv::TM_CCOEFF_NORMED);
+            cv::matchTemplate(screenGray, scaledTemplate, matchResult, cv::TM_CCOEFF_NORMED);
 
-            double minValue = 0.0;
             double maxValue = 0.0;
-            cv::Point minLocation;
             cv::Point maxLocation;
-
-            cv::minMaxLoc(
-                matchResult,
-                &minValue,
-                &maxValue,
-                &minLocation,
-                &maxLocation);
+            cv::minMaxLoc(matchResult, nullptr, &maxValue, nullptr, &maxLocation, validPositions);
 
             if (std::isfinite(maxValue) && maxValue > bestScore)
             {
                 bestScore = maxValue;
                 bestLocation = maxLocation;
                 bestSize = cv::Size(width, height);
+                const int x = maxLocation.x;
+                const int y = maxLocation.y;
+                const int* top = purpleIntegral.ptr<int>(y);
+                const int* bottom = purpleIntegral.ptr<int>(y + height);
+                bestPurpleRatio = (bottom[x + width] - top[x + width] - bottom[x] + top[x]) /
+                    (255.0 * width * height);
             }
         }
 
         if (bestScore < 0.0)
         {
-            diagnostic = "PHOTON marker: no valid template scale.";
+            diagnostic = "PHOTON marker: no valid match containing purple.";
             return false;
         }
-
-        // Purple verification reduces accidental matches against unrelated
-        // UI elements in the same corner of the game screen.
-        cv::Mat hsv;
-        cv::cvtColor(screenRoi, hsv, cv::COLOR_BGR2HSV);
-
-        const cv::Rect candidateRect(
-            bestLocation.x,
-            bestLocation.y,
-            bestSize.width,
-            bestSize.height);
-
-        cv::Mat candidateHsv = hsv(candidateRect);
-        cv::Mat purpleMask;
-        cv::inRange(
-            candidateHsv,
-            cv::Scalar(112, 55, 35),
-            cv::Scalar(175, 255, 255),
-            purpleMask);
-
-        const double purpleRatio =
-            static_cast<double>(cv::countNonZero(purpleMask)) /
-            static_cast<double>(std::max(1, candidateRect.area()));
 
         confidence = bestScore;
         matchCenter.x =
@@ -2648,12 +2213,12 @@ bool DetectPhotonMarkerTemplate(
             "PHOTON marker multi-scale match: " +
             std::to_string(bestScore * 100.0) +
             "%, purple pixels: " +
-            std::to_string(purpleRatio * 100.0) +
+            std::to_string(bestPurpleRatio * 100.0) +
             "%, center: (" +
             std::to_string(matchCenter.x) + ", " +
             std::to_string(matchCenter.y) + ").";
 
-        return bestScore >= 0.60 && purpleRatio >= 0.035;
+        return bestScore >= 0.60;
     }
     catch (const cv::Exception& e)
     {
@@ -2671,191 +2236,72 @@ bool DetectPhotonMarkerTemplate(
 // POST-AUTOMATION IMAGE SEQUENCE
 // ============================================================
 
-bool WaitForAndTapExternalTemplate(
-    const std::string& deviceId,
-    const std::string& filename,
-    const std::string& displayName,
+bool LoadExternalTemplate(
+    const std::string& stem,
+    cv::Mat& image,
     std::ostream& log)
 {
-    cv::Mat image;
-    std::string loadDiagnostic;
-    std::string loadedFilename = filename;
-
-    // Accept PNG, JPG and JPEG files. Try the requested extension first,
-    // then the common alternatives so a marker saved as .jpg is not missed.
-    std::vector<std::string> candidateFiles = { filename };
-
-    const size_t dot = filename.find_last_of('.');
-    const std::string stem =
-        (dot == std::string::npos) ? filename : filename.substr(0, dot);
-
-    const std::string extension =
-        (dot == std::string::npos) ? "" : filename.substr(dot);
-
-    if (_stricmp(extension.c_str(), ".png") == 0)
+    constexpr std::array<const char*, 3> extensions{ ".png", ".jpg", ".jpeg" };
+    for (const char* extension : extensions)
     {
-        candidateFiles.push_back(stem + ".jpg");
-        candidateFiles.push_back(stem + ".jpeg");
-    }
-    else if (_stricmp(extension.c_str(), ".jpg") == 0)
-    {
-        candidateFiles.push_back(stem + ".png");
-        candidateFiles.push_back(stem + ".jpeg");
-    }
-    else if (_stricmp(extension.c_str(), ".jpeg") == 0)
-    {
-        candidateFiles.push_back(stem + ".png");
-        candidateFiles.push_back(stem + ".jpg");
-    }
-    else
-    {
-        candidateFiles.push_back(stem + ".png");
-        candidateFiles.push_back(stem + ".jpg");
-        candidateFiles.push_back(stem + ".jpeg");
-    }
-
-    bool templateLoaded = false;
-
-    for (const std::string& candidate : candidateFiles)
-    {
-        std::string candidateDiagnostic;
-
-        if (LoadPhotonTemplate(
-            GetTemplatePath(Utf8ToWide(candidate)),
-            image,
-            candidateDiagnostic))
-        {
-            loadedFilename = candidate;
-            loadDiagnostic = candidateDiagnostic;
-            templateLoaded = true;
-            break;
-        }
-
-        loadDiagnostic = candidateDiagnostic;
-    }
-
-    if (!templateLoaded)
-    {
-        log << "POST-AUTOMATION: cannot load template "
-            << filename
-            << " (also tried JPG/JPEG alternatives): "
-            << loadDiagnostic << "\n";
-        return false;
-    }
-
-    log << "LOADED TEMPLATE: " << loadedFilename
-        << " | " << loadDiagnostic << "\n";
-
-    log << "WAITING FOR " << displayName
-        << " [" << loadedFilename << "]\n";
-
-    int consecutiveMatches = 0;
-
-    // Intentionally keep searching until this exact item appears.
-    // The next template is never checked before this one is clicked.
-    for (;;)
-    {
-        double confidence = 0.0;
-        POINT center{};
+        const std::string filename = stem + extension;
         std::string diagnostic;
-
-        const bool isPhotonMarker = (filename == "photon_marker.png");
-
-        const bool found = isPhotonMarker
-            ? DetectPhotonMarkerTemplate(
-                deviceId,
-                image,
-                confidence,
-                center,
-                diagnostic)
-            : DetectPhotonTemplate(
-                deviceId,
-                image,
-                confidence,
-                center,
-                diagnostic);
-
-        if (found)
+        if (LoadPhotonTemplate(GetTemplatePath(Utf8ToWide(filename)), image, diagnostic))
         {
-            ++consecutiveMatches;
-
-            if (consecutiveMatches >= 2)
-            {
-                log << displayName << " detected. "
-                    << diagnostic << "\n";
-                log << "CLICKING CENTER: "
-                    << center.x << ", " << center.y << "\n";
-
-                std::string tapDiagnostic;
-
-                if (!TapADB(
-                    deviceId,
-                    center.x,
-                    center.y,
-                    tapDiagnostic))
-                {
-                    log << "CLICK FAILED: "
-                        << tapDiagnostic << "\n";
-                    return false;
-                }
-
-                log << tapDiagnostic << "\n";
-                Sleep(250);
-                return true;
-            }
+            log << diagnostic << "\n";
+            return true;
         }
-        else
-        {
-            consecutiveMatches = 0;
-        }
-
-        Sleep(DETECTION_INTERVAL_MS);
+        log << "Cannot load " << filename << ". " << diagnostic << "\n";
     }
+    return false;
 }
 
 bool RunPostAutomationImageSequence(
     const std::string& deviceId,
     std::ostream& log)
 {
-    log << "\n========================================\n";
-    log << "POST-AUTOMATION IMAGE SEQUENCE\n";
-    log << "========================================\n";
+    log << "\nPOST-AUTOMATION IMAGE SEQUENCE\n";
 
-    if (!WaitForAndTapExternalTemplate(
-        deviceId,
-        "photon_marker.png",
-        "PHOTON marker",
-        log))
+    constexpr std::array<const char*, 7> names
     {
-        log << "POST-AUTOMATION STOPPED at PHOTON marker.\n";
-        return false;
+        "photon_marker", "target_1", "target_2", "target_3", "target_4", "target_5", "target_6"
+    };
+    std::array<cv::Mat, names.size()> templates;
+    for (size_t i = 0; i < names.size(); ++i)
+    {
+        if (IsAutomationCancelled() || !LoadExternalTemplate(names[i], templates[i], log))
+            return false;
     }
 
-    const std::array<const char*, 6> targetFiles =
+    for (size_t i = 0; i < names.size(); ++i)
     {
-        "target_1.png",
-        "target_2.png",
-        "target_3.png",
-        "target_4.png",
-        "target_5.png",
-        "target_6.png"
-    };
-
-    for (size_t i = 0; i < targetFiles.size(); ++i)
-    {
-        const std::string displayName =
-            "TARGET " + std::to_string(i + 1);
-
-        if (!WaitForAndTapExternalTemplate(
-            deviceId,
-            targetFiles[i],
-            displayName,
-            log))
+        log << "Waiting for " << names[i] << "\n";
+        double confidence = 0.0;
+        POINT center{};
+        std::string diagnostic;
+        const bool marker = i == 0;
+        if (!WaitForTemplate(names[i], STAGE_TIMEOUT_MS, 2,
+            [&](double& score, POINT& point, std::string& last, ULONGLONG deadline)
+            {
+                if (marker)
+                    return DetectPhotonMarkerTemplate(deviceId, templates[i], score, point, last, deadline);
+                return DetectPhotonTemplate(deviceId, templates[i], score, point, last, deadline);
+            },
+            confidence, center, diagnostic))
         {
-            log << "POST-AUTOMATION STOPPED at "
-                << displayName << ".\n";
+            log << diagnostic << "\n";
             return false;
         }
+
+        log << diagnostic << "\n";
+        if (!TapADB(deviceId, center.x, center.y, diagnostic))
+        {
+            log << "Click failed. " << diagnostic << "\n";
+            return false;
+        }
+        log << diagnostic << "\n";
+        if (!PauseAutomation(250))
+            return false;
     }
 
     log << "POST-AUTOMATION IMAGE SEQUENCE COMPLETED.\n";
@@ -2874,26 +2320,14 @@ bool LoadUsedRoleplayNames(
     std::unordered_set<std::string>& usedLastNames,
     std::string& diagnostic)
 {
-    wchar_t desktopPath[MAX_PATH]{};
-
-    HRESULT result = SHGetFolderPathW(
-        nullptr,
-        CSIDL_DESKTOPDIRECTORY,
-        nullptr,
-        SHGFP_TYPE_CURRENT,
-        desktopPath
-    );
-
-    if (FAILED(result))
+    const std::wstring filePath = GetNamesHistoryPath();
+    if (filePath.empty())
     {
         diagnostic = "Cannot locate Windows Desktop for unique-name history.";
         return false;
     }
 
-    const std::wstring filePath =
-        std::wstring(desktopPath) + L"\\SmartClick_Names.txt";
-
-    HANDLE file = CreateFileW(
+    const UniqueHandle file(CreateFileW(
         filePath.c_str(),
         GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -2901,9 +2335,9 @@ bool LoadUsedRoleplayNames(
         OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL,
         nullptr
-    );
+    ));
 
-    if (file == INVALID_HANDLE_VALUE)
+    if (file.get() == INVALID_HANDLE_VALUE)
     {
         if (GetLastError() == ERROR_FILE_NOT_FOUND ||
             GetLastError() == ERROR_PATH_NOT_FOUND)
@@ -2919,11 +2353,10 @@ bool LoadUsedRoleplayNames(
     }
 
     LARGE_INTEGER fileSize{};
-    if (!GetFileSizeEx(file, &fileSize) ||
+    if (!GetFileSizeEx(file.get(), &fileSize) ||
         fileSize.QuadPart < 0 ||
         fileSize.QuadPart > 20 * 1024 * 1024)
     {
-        CloseHandle(file);
         diagnostic = "Name history file size is invalid.";
         return false;
     }
@@ -2939,21 +2372,18 @@ bool LoadUsedRoleplayNames(
         );
 
         if (!ReadFile(
-            file,
+            file.get(),
             contents.data() + totalRead,
             request,
             &bytesRead,
             nullptr) || bytesRead == 0)
         {
-            CloseHandle(file);
             diagnostic = "Cannot read complete SmartClick_Names.txt.";
             return false;
         }
 
         totalRead += bytesRead;
     }
-
-    CloseHandle(file);
 
     auto normalize = [](std::string value)
     {
@@ -3101,7 +2531,7 @@ std::pair<std::string, std::string> GenerateRoleplayName(
             uniqueLastNames.push_back(name);
     }
 
-    // Protect the history read and candidate reservation from any parallel callers.
+    // Read a consistent snapshot of the name history.
     std::lock_guard<std::mutex> historyLock(g_NamesFileMutex);
 
     std::unordered_set<std::string> usedFullNames;
@@ -3225,89 +2655,23 @@ std::pair<std::string, std::string> GenerateRoleplayName(
         }
     }
 
-    using NameIndexes = std::pair<size_t, size_t>;
-    std::vector<NameIndexes> neverUsedParts;
-    std::vector<NameIndexes> uniqueFullNames;
-
-    for (size_t firstIndex = 0;
-        firstIndex < uniqueFirstNames.size();
-        ++firstIndex)
+    const auto unusedNames = [&](std::vector<std::string>& names,
+        const std::unordered_set<std::string>& used)
     {
-        const std::string firstKey =
-            normalizeName(uniqueFirstNames[firstIndex]);
-
-        if (usedFirstNames.find(firstKey) != usedFirstNames.end())
-            continue;
-
-        for (size_t lastIndex = 0;
-            lastIndex < uniqueLastNames.size();
-            ++lastIndex)
+        names.erase(std::remove_if(names.begin(), names.end(), [&](const std::string& name)
         {
-            const std::string lastKey =
-                normalizeName(uniqueLastNames[lastIndex]);
+            return used.find(normalizeName(name)) != used.end();
+        }), names.end());
+    };
+    unusedNames(uniqueFirstNames, usedFirstNames);
+    unusedNames(uniqueLastNames, usedLastNames);
 
-            if (usedLastNames.find(lastKey) != usedLastNames.end())
-                continue;
-
-            const std::string fullKey = firstKey + "_" + lastKey;
-
-            if (usedFullNames.find(fullKey) != usedFullNames.end())
-                continue;
-
-            neverUsedParts.emplace_back(firstIndex, lastIndex);
-        }
-    }
-
-    // The generated values must both be new, not merely a new combination.
-    // Fictional syllable combinations provide a much larger fresh-name pool.
-    if (neverUsedParts.empty())
-    {
-        for (size_t firstIndex = 0;
-            firstIndex < uniqueFirstNames.size();
-            ++firstIndex)
-        {
-            const std::string firstKey =
-                normalizeName(uniqueFirstNames[firstIndex]);
-
-            if (usedFirstNames.find(firstKey) != usedFirstNames.end())
-                continue;
-
-            for (size_t lastIndex = 0;
-                lastIndex < uniqueLastNames.size();
-                ++lastIndex)
-            {
-                const std::string lastKey =
-                    normalizeName(uniqueLastNames[lastIndex]);
-
-                if (usedLastNames.find(lastKey) != usedLastNames.end())
-                    continue;
-
-                const std::string fullKey = firstKey + "_" + lastKey;
-
-                if (usedFullNames.find(fullKey) == usedFullNames.end())
-                    uniqueFullNames.emplace_back(firstIndex, lastIndex);
-            }
-        }
-    }
-
-    std::vector<NameIndexes>& candidates =
-        neverUsedParts.empty() ? uniqueFullNames : neverUsedParts;
-
-    if (candidates.empty())
+    if (uniqueFirstNames.empty() || uniqueLastNames.empty())
         return {};
 
-    std::uniform_int_distribution<size_t> candidatePick(
-        0, candidates.size() - 1
-    );
-
-    const NameIndexes selected =
-        candidates[candidatePick(generator)];
-
-    return
-    {
-        uniqueFirstNames[selected.first],
-        uniqueLastNames[selected.second]
-    };
+    std::uniform_int_distribution<size_t> firstPick(0, uniqueFirstNames.size() - 1);
+    std::uniform_int_distribution<size_t> lastPick(0, uniqueLastNames.size() - 1);
+    return { uniqueFirstNames[firstPick(generator)], uniqueLastNames[lastPick(generator)] };
 }
 
 // ============================================================
@@ -3359,7 +2723,8 @@ AutomationResult RunPhotonAutomation(
 
     log << "\nINITIAL DELAY: " << INITIAL_DELAY_MS << " ms\n";
 
-    Sleep(INITIAL_DELAY_MS);
+    if (!PauseAutomation(INITIAL_DELAY_MS))
+        return result;
 
     // --------------------------------------------------------
     // STEP 1: WAIT FOR LOGIN
@@ -3497,7 +2862,8 @@ AutomationResult RunPhotonAutomation(
             if (stillVisible)
             {
                 loginCenter = retryCenter;
-                Sleep(180);
+                if (!PauseAutomation(180))
+                    return result;
             }
             else
             {
@@ -3569,17 +2935,19 @@ AutomationResult RunPhotonAutomation(
     }
 
     log << "FIRST NAME FIELD: " << nameDiagnostic << "\n";
-    Sleep(350);
+    if (!PauseAutomation(350))
+        return result;
 
     std::string inputDiagnostic;
-    if (!InputADBText(device.id, firstName, inputDiagnostic, false))
+    if (!InputADBText(device.id, firstName, inputDiagnostic))
     {
         log << "FIRST NAME INPUT ERROR: " << inputDiagnostic << "\n";
         return result;
     }
 
     log << "FIRST NAME INPUT: " << inputDiagnostic << "\n";
-    Sleep(180);
+    if (!PauseAutomation(180))
+        return result;
 
     // --------------------------------------------------------
     // STEP 4: FIND, CLEAR AND FILL SURNAME FIELD
@@ -3616,20 +2984,20 @@ AutomationResult RunPhotonAutomation(
     }
 
     log << "LAST NAME FIELD: " << surnameDiagnostic << "\n";
-    Sleep(350);
+    if (!PauseAutomation(350))
+        return result;
 
     log << "\nGENERATED LAST NAME: " << lastName << "\n";
-    log << "CREDENTIALS: login - \"" << firstName << "_"
-        << lastName << "\", password - \"" << password << "\"\n";
 
-    if (!InputADBText(device.id, lastName, inputDiagnostic, false))
+    if (!InputADBText(device.id, lastName, inputDiagnostic))
     {
         log << "LAST NAME INPUT ERROR: " << inputDiagnostic << "\n";
         return result;
     }
 
     log << "LAST NAME INPUT: " << inputDiagnostic << "\n";
-    Sleep(180);
+    if (!PauseAutomation(180))
+        return result;
 
     // --------------------------------------------------------
     // STEP 5: CONFIRM INPUT COMMANDS
@@ -3637,9 +3005,7 @@ AutomationResult RunPhotonAutomation(
 
     log << "\n[5] NAME AND SURNAME INPUT COMMANDS SENT\n";
 
-    // UIAutomator may not expose WebView/custom fields.
-    // Successful ADB input commands are therefore not blocked
-    // by an unreliable UIAutomator text dump.
+    // UIAutomator may not expose individual WebView fields.
     result.nameEntered = true;
     result.surnameEntered = true;
 
@@ -3652,10 +3018,8 @@ AutomationResult RunPhotonAutomation(
     std::string saveDiagnostic;
 
     if (!SaveGeneratedName(
-        device.id,
         firstName,
         lastName,
-        password,
         saveDiagnostic))
     {
         log
@@ -3681,7 +3045,8 @@ AutomationResult RunPhotonAutomation(
         return result;
     }
 
-    Sleep(250);
+    if (!PauseAutomation(250))
+        return result;
 
     // --------------------------------------------------------
     // STEP 8: WAIT FOR PASSWORD FIELD
@@ -3716,13 +3081,13 @@ AutomationResult RunPhotonAutomation(
     }
 
     // Let the password control finish its transition and receive focus.
-    Sleep(900);
+    if (!PauseAutomation(900))
+        return result;
 
     if (!InputADBText(
         device.id,
         password,
-        inputDiagnostic,
-        false))
+        inputDiagnostic))
     {
         log << "PASSWORD INPUT ERROR: "
             << inputDiagnostic << "\n";
@@ -3765,13 +3130,13 @@ AutomationResult RunPhotonAutomation(
 
     // The repeat-password screen can animate for roughly two seconds.
     // Wait before typing and do not reactivate the window after tapping the field.
-    Sleep(1400);
+    if (!PauseAutomation(1400))
+        return result;
 
     if (!InputADBText(
         device.id,
         password,
-        inputDiagnostic,
-        false))
+        inputDiagnostic))
     {
         log << "REPEAT PASSWORD INPUT ERROR: "
             << inputDiagnostic << "\n";
@@ -3789,8 +3154,6 @@ AutomationResult RunPhotonAutomation(
     if (!WaitAndTapStage(device.id, "register", log))
         return result;
 
-    result.registrationCompleted = true;
-
     // --------------------------------------------------------
     // STEP 11: SKIP
     // --------------------------------------------------------
@@ -3799,6 +3162,8 @@ AutomationResult RunPhotonAutomation(
 
     if (!WaitAndTapStage(device.id, "skip", log))
         return result;
+
+    result.registrationCompleted = true;
 
     // --------------------------------------------------------
     // STEP 12: NEXT
@@ -3837,10 +3202,80 @@ AutomationResult RunPhotonAutomation(
 // AUTOMATION: ALL SELECTED DEVICES
 // ============================================================
 
+std::string RunAutomationBatch(const std::vector<ADBDevice>& devices, const std::string& password)
+{
+    std::vector<bool> primarySucceeded(devices.size());
+    size_t completed = 0;
+    size_t failed = 0;
+
+    LivePhotonLogBuffer logBuffer;
+    std::ostream log(&logBuffer);
+    log << "Devices are processed sequentially because Windows input is shared.\n";
+
+    for (size_t i = 0; i < devices.size() && !IsAutomationCancelled(); ++i)
+    {
+        try
+        {
+            primarySucceeded[i] = RunPhotonAutomation(devices[i], log, password).success;
+        }
+        catch (const std::exception& error)
+        {
+            log << "Automation failed: " << error.what() << "\n";
+        }
+        catch (...)
+        {
+            log << "Unknown automation error.\n";
+        }
+        if (!primarySucceeded[i] && !IsAutomationCancelled())
+            ++failed;
+        log << "[" << devices[i].id << "] Registration and startup: "
+            << (primarySucceeded[i] ? "completed" : IsAutomationCancelled() ? "cancelled" : "failed") << "\n";
+    }
+
+    for (size_t i = 0; i < devices.size() && !IsAutomationCancelled(); ++i)
+    {
+        if (!primarySucceeded[i])
+            continue;
+
+        log << "\nPost-automation on " << devices[i].id << "\n";
+        bool succeeded = false;
+        try
+        {
+            succeeded = RunPostAutomationImageSequence(devices[i].id, log);
+        }
+        catch (const std::exception& error)
+        {
+            log << "Post-automation failed: " << error.what() << "\n";
+        }
+        catch (...)
+        {
+            log << "Unknown post-automation error.\n";
+        }
+        if (succeeded)
+            ++completed;
+        else if (!IsAutomationCancelled())
+            ++failed;
+    }
+
+    const size_t cancelled = devices.size() - completed - failed;
+    std::string summary = "Completed: " + std::to_string(completed) +
+        ", failed: " + std::to_string(failed) +
+        ", cancelled: " + std::to_string(cancelled) + ".";
+    log << "\n" << summary << "\n";
+    return summary;
+}
+
 void StartPhotonAutomation()
 {
-    if (g_AutomationBusy.load())
+    if (g_AutomationBusy || g_ADBJob.valid())
         return;
+
+    if (g_ADBStatus == "ADB error" || g_ADBStatus == "Invalid ADB output")
+    {
+        g_Notification = "Refresh the ADB device list before starting automation.";
+        AppendPhotonLog("[START BLOCKED] ADB device list is out of date.\n");
+        return;
+    }
 
     if (!g_TemplatesLoaded)
     {
@@ -3863,7 +3298,7 @@ void StartPhotonAutomation()
     if (!IsSafeADBText(g_RegistrationPassword))
     {
         g_Notification =
-            "Password must use English letters and digits only.";
+            "Enter a registration password using English letters and digits.";
         AppendPhotonLog(
             "[START BLOCKED] Password must use English letters and digits only.\n"
         );
@@ -3900,8 +3335,12 @@ void StartPhotonAutomation()
 
     for (const ADBDevice& device : selectedDevices)
     {
-        if (!device.automationWindow ||
-            !IsWindow(device.automationWindow))
+        if (device.status != "device")
+            continue;
+
+        const bool listed = std::any_of(g_EmulatorWindows.begin(), g_EmulatorWindows.end(),
+            [&](const EmulatorWindow& window) { return window.handle == device.automationWindow; });
+        if (!listed || !IsWindow(device.automationWindow))
         {
             g_Notification =
                 "Assign an LDPlayer window to each selected ADB device "
@@ -3932,9 +3371,17 @@ void StartPhotonAutomation()
         usedWindows.push_back(device.automationWindow);
     }
 
+    if (usedWindows.empty())
+    {
+        g_Notification = "Select at least one ready ADB device.";
+        AppendPhotonLog("[START BLOCKED] No selected device is ready.\n");
+        return;
+    }
+
     if (g_AutomationThread.joinable())
         g_AutomationThread.join();
 
+    std::string passwordSnapshot = g_RegistrationPassword;
     {
         std::lock_guard<std::mutex> lock(g_LogMutex);
         g_PhotonDetectionLog.clear();
@@ -3947,218 +3394,230 @@ void StartPhotonAutomation()
         g_DeviceWindowMap.clear();
 
         for (const ADBDevice& device : selectedDevices)
-            g_DeviceWindowMap[device.id] = device.automationWindow;
+        {
+            WindowIdentity identity;
+            identity.handle = device.automationWindow;
+            GetWindowThreadProcessId(identity.handle, &identity.processId);
+            g_DeviceWindowMap.emplace(device.id, identity);
+        }
     }
 
+    g_CancelAutomation = false;
     g_AutomationBusy = true;
-    g_Notification =
-        "PHOTON automation is running with real mouse/keyboard...";
+    g_Notification = "PHOTON automation is running.";
 
-    const std::string passwordSnapshot = g_RegistrationPassword;
-
-    g_AutomationThread = std::thread(
-        [selectedDevices, passwordSnapshot]()
-        {
-            std::vector<AutomationResult> results(
-                selectedDevices.size()
-            );
-
-            AppendPhotonLog(
-                "Input mode: real Windows mouse and keyboard.\n"
-                "Live diagnostics enabled.\n"
-                "Physical mouse/keyboard are global, so devices run sequentially.\n"
-            );
-
-            // Desktop mouse/keyboard are global, so selected emulators
-            // must be automated sequentially rather than in parallel.
-            for (size_t i = 0; i < selectedDevices.size(); ++i)
+    try
+    {
+        g_AutomationThread = std::thread(
+            [devices = std::move(selectedDevices), password = std::move(passwordSnapshot)]
             {
-                LivePhotonLogBuffer logBuffer;
-                std::ostream log(&logBuffer);
-
-                log
-                    << "\n========================================\n"
-                    << "DEVICE " << (i + 1) << "/"
-                    << selectedDevices.size() << ": "
-                    << selectedDevices[i].id << "\n"
-                    << "INPUT MODE: REAL WINDOWS MOUSE + KEYBOARD\n"
-                    << "========================================\n";
+                struct BusyReset
+                {
+                    ~BusyReset() { g_AutomationBusy = false; }
+                } reset;
 
                 try
                 {
-                    results[i] = RunPhotonAutomation(
-                        selectedDevices[i],
-                        log,
-                        passwordSnapshot
-                    );
-                }
-                catch (const cv::Exception& e)
-                {
-                    log << "OpenCV exception: " << e.what() << "\n";
-                }
-                catch (const std::exception& e)
-                {
-                    log << "C++ exception: " << e.what() << "\n";
+                    g_AutomationNotification = RunAutomationBatch(devices, password);
                 }
                 catch (...)
                 {
-                    log << "Unknown automation exception.\n";
+                    g_AutomationNotification = "Automation stopped because of an unexpected error.";
                 }
-
-                log
-                    << "DEVICE RESULT: "
-                    << (results[i].success ? "SUCCESS" : "FAILED")
-                    << "\n";
-            }
-
-            // Run the optional visual sequence only after all primary
-            // device automations have finished successfully.
-            for (size_t i = 0; i < selectedDevices.size(); ++i)
-            {
-                if (!results[i].success)
-                    continue;
-
-                LivePhotonLogBuffer postLogBuffer;
-                std::ostream postLog(&postLogBuffer);
-
-                postLog
-                    << "\n========================================\n"
-                    << "POST-AUTOMATION DEVICE "
-                    << selectedDevices[i].id << "\n"
-                    << "========================================\n";
-
-                try
-                {
-                    if (!RunPostAutomationImageSequence(
-                        selectedDevices[i].id,
-                        postLog))
-                    {
-                        postLog << "Post-automation sequence did not complete.\n";
-                    }
-                }
-                catch (const cv::Exception& e)
-                {
-                    postLog << "Post-automation OpenCV exception: "
-                            << e.what() << "\n";
-                }
-                catch (const std::exception& e)
-                {
-                    postLog << "Post-automation exception: "
-                            << e.what() << "\n";
-                }
-                catch (...)
-                {
-                    postLog << "Unknown post-automation exception.\n";
-                }
-            }
-
-            int successCount = 0;
-            int failedCount = 0;
-
-            for (const AutomationResult& result : results)
-            {
-                if (result.success)
-                    successCount++;
-                else
-                    failedCount++;
-            }
-
-            std::ostringstream summary;
-            summary
-                << "\n========================================\n"
-                << "PHOTON AUTOMATION FINISHED\n"
-                << "SUCCESS: " << successCount << "\n"
-                << "FAILED: " << failedCount << "\n"
-                << "========================================\n";
-
-            AppendPhotonLog(summary.str());
-
-            {
-                std::lock_guard<std::mutex> lock(g_DeviceWindowMapMutex);
-                g_DeviceWindowMap.clear();
-            }
-
-            g_Notification =
-                "Automation finished. Success: " +
-                std::to_string(successCount) +
-                ", failed: " +
-                std::to_string(failedCount);
-
-            g_AutomationBusy = false;
-        }
-    );
+            });
+    }
+    catch (const std::exception& error)
+    {
+        g_AutomationBusy = false;
+        g_Notification = std::string("Cannot start automation: ") + error.what();
+        AppendPhotonLog(g_Notification + "\n");
+    }
 }
 
 // ============================================================
 // ADB DEVICE MANAGER
 // ============================================================
 
-void RefreshADBDevices()
+void ApplyADBDeviceList(std::string output)
 {
-    std::vector<ADBDevice> previousDevices = g_Devices;
-
-    g_Devices.clear();
-    g_SelectedDevice = -1;
-
-    g_ADBStatus = "Checking ADB...";
-
-    std::string output = ExecuteADB(L"devices -l");
-
-    g_ADBOutput = output;
-
-    if (IsADBError(output))
+    g_ADBOutput = std::move(output);
+    if (IsADBError(g_ADBOutput))
     {
         g_ADBStatus = "ADB error";
-        g_Notification = "Cannot execute ADB";
+        g_Notification = "Cannot execute ADB. See the ADB log.";
         return;
     }
 
-    std::istringstream stream(output);
+    std::vector<ADBDevice> refreshed;
+    std::unordered_set<std::string> seen;
+    std::istringstream stream(g_ADBOutput);
     std::string line;
-
+    bool hasHeader = false;
     while (std::getline(stream, line))
     {
         line = Trim(line);
-
-        if (line.empty() ||
-            line.find("List of devices") != std::string::npos)
-            continue;
-
-        std::istringstream lineStream(line);
-
-        ADBDevice device;
-
-        if (!(lineStream >> device.id >> device.status))
-            continue;
-
-        if (device.id == "*")
-            continue;
-
-        device.model = GetModelFromLine(line);
-        device.selected = false;
-
-        for (const ADBDevice& previous : previousDevices)
+        if (line == "List of devices attached")
         {
-            if (previous.id == device.id)
-            {
-                device.selected = previous.selected;
-                device.automationWindow = previous.automationWindow;
-                break;
-            }
+            hasHeader = true;
+            continue;
         }
+        if (!hasHeader || line.empty() || line.front() == '*')
+            continue;
 
-        g_Devices.push_back(device);
+        std::istringstream fields(line);
+        ADBDevice device;
+        if (!(fields >> device.id >> device.status) || !seen.insert(device.id).second)
+            continue;
+
+        if (device.status == "no")
+            device.status = "no permissions";
+        device.model = GetModelFromLine(line);
+        const auto previous = std::find_if(g_Devices.begin(), g_Devices.end(),
+            [&](const ADBDevice& entry) { return entry.id == device.id; });
+        if (previous != g_Devices.end())
+        {
+            device.selected = previous->selected;
+            device.automationWindow = previous->automationWindow;
+        }
+        refreshed.push_back(std::move(device));
     }
 
+    if (!hasHeader)
+    {
+        g_ADBStatus = "Invalid ADB output";
+        g_Notification = "ADB did not return a device list.";
+        return;
+    }
+
+    g_Devices = std::move(refreshed);
+    const bool hasReadyDevice = std::any_of(g_Devices.begin(), g_Devices.end(),
+        [](const ADBDevice& device) { return device.status == "device"; });
     if (g_Devices.empty())
-    {
         g_ADBStatus = "No devices found";
-        g_Notification = "No ADB devices detected";
-    }
     else
+        g_ADBStatus = hasReadyDevice ? "Connected" : "No devices ready";
+    g_Notification = "ADB device list updated.";
+}
+
+void RefreshADBDevices()
+{
+    if (g_ADBJob.valid() || g_AutomationBusy)
+        return;
+
+    try
     {
-        g_ADBStatus = "Connected";
-        g_Notification = "ADB devices refreshed";
+        g_ADBJob = std::async(std::launch::async, []
+        {
+            AdbJobResult result;
+            result.output = ExecuteADB(L"devices -l");
+            return result;
+        });
+        g_ADBStatus = "Checking ADB...";
+    }
+    catch (const std::exception& error)
+    {
+        g_ADBStatus = "ADB error";
+        g_Notification = std::string("Cannot start device refresh: ") + error.what();
+    }
+}
+
+void LaunchPhotonOnSelectedDevices()
+{
+    if (g_ADBJob.valid() || g_AutomationBusy)
+        return;
+
+    if (g_ADBStatus == "ADB error" || g_ADBStatus == "Invalid ADB output")
+    {
+        g_Notification = "Refresh the ADB device list before launching PHOTON.";
+        return;
+    }
+
+    std::vector<ADBDevice> selected;
+    for (const ADBDevice& device : g_Devices)
+    {
+        if (device.selected)
+            selected.push_back(device);
+    }
+
+    if (selected.empty())
+    {
+        g_Notification = "Select at least one ADB device.";
+        return;
+    }
+
+    try
+    {
+        g_ADBJob = std::async(std::launch::async, [selected = std::move(selected)]
+        {
+            AdbJobResult result;
+            result.launch = true;
+            std::ostringstream log;
+            size_t launched = 0;
+            for (const ADBDevice& device : selected)
+            {
+                if (g_ShutdownRequested)
+                    break;
+                log << "[" << device.id << "] ";
+                if (device.status != "device")
+                {
+                    log << "Skipped. Device is " << device.status << ".\n";
+                    continue;
+                }
+
+                const std::string output = ExecuteADB(
+                    L"-s " + DeviceArgument(device.id) +
+                    L" shell monkey -p com.photon.top -c android.intent.category.LAUNCHER 1");
+                log << (output.empty() ? "ADB returned empty output." : Trim(output)) << "\n";
+                if (!IsADBError(output) &&
+                    output.find("Events injected: 1") != std::string::npos)
+                {
+                    ++launched;
+                }
+            }
+            result.output = log.str();
+            result.notification = "PHOTON launch confirmed: " + std::to_string(launched) +
+                " of " + std::to_string(selected.size()) + ".";
+            return result;
+        });
+        g_PhotonLaunchLog = "Launching PHOTON...";
+        g_Notification = g_PhotonLaunchLog;
+    }
+    catch (const std::exception& error)
+    {
+        g_Notification = std::string("Cannot start PHOTON launch: ") + error.what();
+    }
+}
+
+void PollBackgroundJobs()
+{
+    if (!g_AutomationBusy && g_AutomationThread.joinable())
+    {
+        g_AutomationThread.join();
+        g_Notification = std::move(g_AutomationNotification);
+    }
+
+    if (!g_ADBJob.valid() ||
+        g_ADBJob.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+        return;
+
+    try
+    {
+        AdbJobResult result = g_ADBJob.get();
+        if (result.launch)
+        {
+            g_PhotonLaunchLog = std::move(result.output);
+            g_Notification = std::move(result.notification);
+        }
+        else
+        {
+            ApplyADBDeviceList(std::move(result.output));
+        }
+    }
+    catch (const std::exception& error)
+    {
+        if (g_ADBStatus == "Checking ADB...")
+            g_ADBStatus = "ADB error";
+        g_Notification = std::string("ADB background task failed: ") + error.what();
     }
 }
 
@@ -4181,8 +3640,10 @@ BOOL CALLBACK EnumEmulatorWindows(HWND hwnd, LPARAM)
         L'\0'
     );
 
-    GetWindowTextW(hwnd, title.data(), length + 1);
-    title.resize(length);
+    const int copied = GetWindowTextW(hwnd, title.data(), length + 1);
+    if (copied <= 0)
+        return TRUE;
+    title.resize(static_cast<size_t>(copied));
 
     bool isEmulator =
         ContainsIgnoreCase(title, L"LDPlayer") ||
@@ -4202,11 +3663,18 @@ BOOL CALLBACK EnumEmulatorWindows(HWND hwnd, LPARAM)
 
 void RefreshEmulatorWindows()
 {
+    const HWND previouslySelected =
+        g_SelectedWindow >= 0 && g_SelectedWindow < static_cast<int>(g_EmulatorWindows.size())
+        ? g_EmulatorWindows[g_SelectedWindow].handle : nullptr;
     g_EmulatorWindows.clear();
     g_SelectedWindow = -1;
 
     EnumWindows(EnumEmulatorWindows, 0);
-
+    for (size_t i = 0; i < g_EmulatorWindows.size(); ++i)
+    {
+        if (g_EmulatorWindows[i].handle == previouslySelected)
+            g_SelectedWindow = static_cast<int>(i);
+    }
     if (g_EmulatorWindows.size() == 1)
         g_SelectedWindow = 0;
 
@@ -4215,8 +3683,8 @@ void RefreshEmulatorWindows()
 
 void RefreshEverything()
 {
-    RefreshADBDevices();
     RefreshEmulatorWindows();
+    RefreshADBDevices();
 }
 
 // ============================================================
@@ -4740,76 +4208,10 @@ void DrawAutoLaunch()
 
     ImGui::Spacing();
 
+    ImGui::BeginDisabled(g_ADBJob.valid() || g_AutomationBusy);
     if (ImGui::Button("START PHOTON", ImVec2(220, 48)))
-    {
-        g_PhotonLaunchLog.clear();
-
-        if (selectedCount == 0)
-        {
-            g_PhotonLaunchLog =
-                "ERROR: No ADB devices selected.";
-
-            g_Notification =
-                "Select at least one ADB device.";
-        }
-        else
-        {
-            int launchedCount = 0;
-            int skippedCount = 0;
-
-            for (const ADBDevice& device : g_Devices)
-            {
-                if (!device.selected)
-                    continue;
-
-                g_PhotonLaunchLog +=
-                    "\n[" + device.id + "] ";
-
-                if (device.status != "device")
-                {
-                    g_PhotonLaunchLog +=
-                        "SKIPPED - device is not ready.\n";
-
-                    skippedCount++;
-                    continue;
-                }
-
-                g_PhotonLaunchLog +=
-                    "Sending launch command...\n";
-
-                std::wstring arguments =
-                    L"-s " + DeviceArgument(device.id) +
-                    L" shell monkey -p com.photon.top "
-                    L"-c android.intent.category.LAUNCHER 1";
-
-                std::string output = ExecuteADB(arguments);
-
-                if (IsADBError(output))
-                {
-                    g_PhotonLaunchLog +=
-                        "ERROR: " + output + "\n";
-
-                    skippedCount++;
-                }
-                else
-                {
-                    g_PhotonLaunchLog += output;
-
-                    if (output.empty())
-                        g_PhotonLaunchLog +=
-                        "ADB returned empty output.\n";
-
-                    launchedCount++;
-                }
-            }
-
-            g_Notification =
-                "Photon launch commands sent: " +
-                std::to_string(launchedCount) +
-                ", skipped: " +
-                std::to_string(skippedCount);
-        }
-    }
+        LaunchPhotonOnSelectedDevices();
+    ImGui::EndDisabled();
 
     ImGui::EndChild();
 
@@ -4900,39 +4302,26 @@ void DrawAutoLaunch()
 
     ImGui::Spacing();
 
-    ImGui::TextWrapped(
-        "Each selected emulator runs its own automation worker. "
-        "Every next button is detected before clicking."
-    );
+    ImGui::TextWrapped("Selected emulators run sequentially.");
 
     ImGui::Spacing();
 
-    if (g_AutomationBusy.load())
+    if (g_AutomationBusy)
     {
-        ImGui::BeginDisabled();
-
-        ImGui::Button(
-            "AUTOMATION RUNNING...",
-            ImVec2(260, 48)
-        );
-
+        ImGui::BeginDisabled(g_CancelAutomation);
+        if (ImGui::Button(g_CancelAutomation ? "STOPPING..." : "STOP AUTOMATION", ImVec2(260, 48)))
+        {
+            g_CancelAutomation = true;
+            g_Notification = "Stopping automation...";
+        }
         ImGui::EndDisabled();
-
-        ImGui::SameLine();
-
-        ImGui::TextColored(
-            ImVec4(0.30f, 0.80f, 0.45f, 1.0f),
-            "Working in background..."
-        );
     }
     else
     {
-        if (ImGui::Button(
-            "START FULL AUTOMATION",
-            ImVec2(260, 48)))
-        {
+        ImGui::BeginDisabled(g_ADBJob.valid());
+        if (ImGui::Button("START FULL AUTOMATION", ImVec2(260, 48)))
             StartPhotonAutomation();
-        }
+        ImGui::EndDisabled();
     }
 
     ImGui::Spacing();
@@ -5326,23 +4715,16 @@ void DrawMainInterface()
 // DIRECTX HELPERS
 // ============================================================
 
-void CreateRenderTarget()
+HRESULT CreateRenderTarget()
 {
     ID3D11Texture2D* backBuffer = nullptr;
+    HRESULT result = g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
+    if (FAILED(result))
+        return result;
 
-    if (SUCCEEDED(
-        g_pSwapChain->GetBuffer(
-            0,
-            IID_PPV_ARGS(&backBuffer))))
-    {
-        g_pd3dDevice->CreateRenderTargetView(
-            backBuffer,
-            nullptr,
-            &g_mainRenderTargetView
-        );
-
-        backBuffer->Release();
-    }
+    result = g_pd3dDevice->CreateRenderTargetView(backBuffer, nullptr, &g_mainRenderTargetView);
+    backBuffer->Release();
+    return result;
 }
 
 void CleanupRenderTarget()
@@ -5354,7 +4736,7 @@ void CleanupRenderTarget()
     }
 }
 
-bool CreateDeviceD3D(HWND hwnd)
+HRESULT CreateDeviceD3D(HWND hwnd)
 {
     DXGI_SWAP_CHAIN_DESC swapChainDesc{};
 
@@ -5365,9 +4747,6 @@ bool CreateDeviceD3D(HWND hwnd)
 
     swapChainDesc.BufferDesc.RefreshRate.Numerator = 60;
     swapChainDesc.BufferDesc.RefreshRate.Denominator = 1;
-
-    swapChainDesc.Flags =
-        DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
 
     swapChainDesc.BufferUsage =
         DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -5391,45 +4770,38 @@ bool CreateDeviceD3D(HWND hwnd)
         D3D_FEATURE_LEVEL_10_0
     };
 
-    HRESULT result = D3D11CreateDeviceAndSwapChain(
-        nullptr,
-        D3D_DRIVER_TYPE_HARDWARE,
-        nullptr,
-        createFlags,
-        featureLevels,
-        2,
-        D3D11_SDK_VERSION,
-        &swapChainDesc,
-        &g_pSwapChain,
-        &g_pd3dDevice,
-        &featureLevel,
-        &g_pd3dDeviceContext
-    );
-
-    if (result == DXGI_ERROR_UNSUPPORTED)
+    const auto create = [&](D3D_DRIVER_TYPE driver)
     {
-        result = D3D11CreateDeviceAndSwapChain(
-            nullptr,
-            D3D_DRIVER_TYPE_WARP,
-            nullptr,
-            createFlags,
-            featureLevels,
-            2,
-            D3D11_SDK_VERSION,
-            &swapChainDesc,
-            &g_pSwapChain,
-            &g_pd3dDevice,
-            &featureLevel,
-            &g_pd3dDeviceContext
-        );
+        return D3D11CreateDeviceAndSwapChain(
+            nullptr, driver, nullptr, createFlags,
+            featureLevels, ARRAYSIZE(featureLevels), D3D11_SDK_VERSION,
+            &swapChainDesc, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
+    };
+
+    HRESULT result = create(D3D_DRIVER_TYPE_HARDWARE);
+    if (result == DXGI_ERROR_SDK_COMPONENT_MISSING && createFlags != 0)
+    {
+        createFlags = 0;
+        result = create(D3D_DRIVER_TYPE_HARDWARE);
     }
-
     if (FAILED(result))
-        return false;
+        result = create(D3D_DRIVER_TYPE_WARP);
 
-    CreateRenderTarget();
+    return FAILED(result) ? result : CreateRenderTarget();
+}
 
-    return true;
+HRESULT ApplyPendingResize()
+{
+    if (!g_PendingWidth || !g_PendingHeight)
+        return S_OK;
+
+    g_pd3dDeviceContext->OMSetRenderTargets(0, nullptr, nullptr);
+    CleanupRenderTarget();
+    const HRESULT result = g_pSwapChain->ResizeBuffers(
+        0, g_PendingWidth, g_PendingHeight, DXGI_FORMAT_UNKNOWN, 0);
+    g_PendingWidth = 0;
+    g_PendingHeight = 0;
+    return FAILED(result) ? result : CreateRenderTarget();
 }
 
 void CleanupDeviceD3D()
@@ -5473,11 +4845,7 @@ LRESULT WINAPI WndProc(
     WPARAM wParam,
     LPARAM lParam)
 {
-    if (ImGui_ImplWin32_WndProcHandler(
-        hWnd,
-        msg,
-        wParam,
-        lParam))
+    if (ImGui::GetCurrentContext() && ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
     {
         return true;
     }
@@ -5485,22 +4853,12 @@ LRESULT WINAPI WndProc(
     switch (msg)
     {
     case WM_SIZE:
-        if (g_pd3dDevice != nullptr &&
-            wParam != SIZE_MINIMIZED)
+        g_Minimized = wParam == SIZE_MINIMIZED;
+        if (!g_Minimized)
         {
-            CleanupRenderTarget();
-
-            g_pSwapChain->ResizeBuffers(
-                0,
-                LOWORD(lParam),
-                HIWORD(lParam),
-                DXGI_FORMAT_UNKNOWN,
-                0
-            );
-
-            CreateRenderTarget();
+            g_PendingWidth = LOWORD(lParam);
+            g_PendingHeight = HIWORD(lParam);
         }
-
         return 0;
 
     case WM_SYSCOMMAND:
@@ -5510,6 +4868,7 @@ LRESULT WINAPI WndProc(
         break;
 
     case WM_DESTROY:
+        g_ShutdownRequested = true;
         PostQuitMessage(0);
         return 0;
     }
@@ -5532,6 +4891,8 @@ int WINAPI WinMain(
     LPSTR,
     int)
 {
+    ImGui_ImplWin32_EnableDpiAwareness();
+
     WNDCLASSEXW wc{};
 
     wc.cbSize = sizeof(WNDCLASSEXW);
@@ -5540,7 +4901,8 @@ int WINAPI WinMain(
     wc.hInstance = hInstance;
     wc.lpszClassName = L"SmartClickWindow";
 
-    RegisterClassExW(&wc);
+    if (!RegisterClassExW(&wc))
+        return 1;
 
     g_hWnd = CreateWindowW(
         wc.lpszClassName,
@@ -5566,43 +4928,44 @@ int WINAPI WinMain(
         return 1;
     }
 
-    if (!CreateDeviceD3D(g_hWnd))
+    HRESULT graphicsResult = CreateDeviceD3D(g_hWnd);
+    if (FAILED(graphicsResult))
     {
+        MessageBoxW(g_hWnd, L"Could not initialize Direct3D 11.", L"SmartClick", MB_OK | MB_ICONERROR);
         CleanupDeviceD3D();
+        DestroyWindow(g_hWnd);
+        UnregisterClassW(wc.lpszClassName, wc.hInstance);
+        return 1;
+    }
+    g_PendingWidth = 0;
+    g_PendingHeight = 0;
 
-        UnregisterClassW(
-            wc.lpszClassName,
-            wc.hInstance
-        );
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    SetupImGuiStyle();
 
+    const bool platformReady = ImGui_ImplWin32_Init(g_hWnd);
+    if (!platformReady || !ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext))
+    {
+        MessageBoxW(g_hWnd, L"Could not initialize the interface.", L"SmartClick", MB_OK | MB_ICONERROR);
+        if (platformReady)
+            ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
+        CleanupDeviceD3D();
+        DestroyWindow(g_hWnd);
+        UnregisterClassW(wc.lpszClassName, wc.hInstance);
         return 1;
     }
 
     ShowWindow(g_hWnd, SW_SHOWDEFAULT);
     UpdateWindow(g_hWnd);
 
-    IMGUI_CHECKVERSION();
-
-    ImGui::CreateContext();
-
-    ImGuiIO& io = ImGui::GetIO();
-
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-
-    SetupImGuiStyle();
-
-    ImGui_ImplWin32_Init(g_hWnd);
-
-    ImGui_ImplDX11_Init(
-        g_pd3dDevice,
-        g_pd3dDeviceContext
-    );
-
     LoadPhotonTemplates();
     RefreshEverything();
 
     MSG msg{};
-
+    bool occluded = false;
     while (g_Running)
     {
         while (PeekMessageW(
@@ -5612,15 +4975,41 @@ int WINAPI WinMain(
             0U,
             PM_REMOVE))
         {
+            if (msg.message == WM_QUIT)
+            {
+                g_Running = false;
+                break;
+            }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
-
-            if (msg.message == WM_QUIT)
-                g_Running = false;
         }
 
         if (!g_Running)
             break;
+
+        PollBackgroundJobs();
+        if (g_Minimized)
+        {
+            Sleep(20);
+            continue;
+        }
+
+        graphicsResult = ApplyPendingResize();
+        if (FAILED(graphicsResult))
+            break;
+
+        if (occluded)
+        {
+            graphicsResult = g_pSwapChain->Present(0, DXGI_PRESENT_TEST);
+            if (FAILED(graphicsResult))
+                break;
+            if (graphicsResult == DXGI_STATUS_OCCLUDED)
+            {
+                Sleep(20);
+                continue;
+            }
+            occluded = false;
+        }
 
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
@@ -5654,11 +5043,17 @@ int WINAPI WinMain(
             ImGui::GetDrawData()
         );
 
-        g_pSwapChain->Present(1, 0);
+        graphicsResult = g_pSwapChain->Present(1, 0);
+        if (FAILED(graphicsResult))
+            break;
+        occluded = graphicsResult == DXGI_STATUS_OCCLUDED;
     }
 
+    g_ShutdownRequested = true;
     if (g_AutomationThread.joinable())
         g_AutomationThread.join();
+    if (g_ADBJob.valid())
+        g_ADBJob.wait();
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
@@ -5667,12 +5062,10 @@ int WINAPI WinMain(
 
     CleanupDeviceD3D();
 
+    if (FAILED(graphicsResult))
+        MessageBoxW(g_hWnd, L"Direct3D rendering failed. Restart SmartClick.", L"SmartClick", MB_OK | MB_ICONERROR);
+
     DestroyWindow(g_hWnd);
-
-    UnregisterClassW(
-        wc.lpszClassName,
-        wc.hInstance
-    );
-
-    return 0;
+    UnregisterClassW(wc.lpszClassName, wc.hInstance);
+    return FAILED(graphicsResult) ? 1 : 0;
 }
