@@ -12,13 +12,13 @@
 
 #include <shlobj.h>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <sstream>
 #include <algorithm>
 #include <future>
 #include <exception>
 #include <cstdint>
-#include <cwctype>
 #include <thread>
 #include <atomic>
 #include <mutex>
@@ -80,7 +80,6 @@ static std::string g_ADBStatus = "Not connected";
 static std::string g_Notification = "SmartClick initialized";
 
 static int g_CurrentPage = 0;
-static int g_SelectedWindow = -1;
 
 static std::atomic<bool> g_AutomationBusy{ false };
 static std::atomic<bool> g_CancelAutomation{ false };
@@ -234,13 +233,6 @@ struct ADBDevice
     std::string status;
     std::string model;
     bool selected = false;
-    HWND automationWindow = nullptr;
-};
-
-struct EmulatorWindow
-{
-    HWND handle = nullptr;
-    std::wstring title;
 };
 
 struct AutomationResult
@@ -253,18 +245,6 @@ struct AutomationResult
 };
 
 static std::vector<ADBDevice> g_Devices;
-static std::vector<EmulatorWindow> g_EmulatorWindows;
-
-// Real Win32 input is global to the desktop, so automation is serialized.
-// Each ADB device is explicitly mapped to its visible LDPlayer top-level HWND.
-static std::mutex g_DeviceWindowMapMutex;
-struct WindowIdentity
-{
-    HWND handle = nullptr;
-    DWORD processId = 0;
-};
-static std::map<std::string, WindowIdentity> g_DeviceWindowMap;
-
 static const char* g_PageNames[] =
 {
     "Dashboard",
@@ -364,19 +344,6 @@ std::string GetModelFromLine(const std::string& line)
         end = line.length();
 
     return line.substr(position, end - position);
-}
-
-bool ContainsIgnoreCase(
-    const std::wstring& text,
-    const std::wstring& search)
-{
-    std::wstring a = text;
-    std::wstring b = search;
-
-    std::transform(a.begin(), a.end(), a.begin(), towlower);
-    std::transform(b.begin(), b.end(), b.begin(), towlower);
-
-    return a.find(b) != std::wstring::npos;
 }
 
 // ============================================================
@@ -490,10 +457,19 @@ bool RunProcess(
     std::string& diagnostic,
     DWORD timeoutMs,
     bool captureStderr = true,
-    bool automation = false)
+    bool automation = false,
+    std::string_view standardInput = {})
 {
     output.clear();
     diagnostic.clear();
+    // Keep the input below the pipe capacity so it can be written before launch.
+    constexpr DWORD stdinCapacity = 4096;
+    if (standardInput.size() > stdinCapacity)
+    {
+        diagnostic = "ADB standard input is too large.";
+        return false;
+    }
+
     if (executable.empty())
     {
         diagnostic = "ADB executable not found. Set SMARTCLICK_ADB_PATH to adb.exe.";
@@ -543,10 +519,32 @@ bool RunProcess(
             return false;
         }
 
+        UniqueHandle childInput(nullptr);
+        if (!standardInput.empty())
+        {
+            HANDLE inputRead = nullptr;
+            HANDLE inputWrite = nullptr;
+            if (!CreatePipe(&inputRead, &inputWrite, &security, stdinCapacity))
+            {
+                diagnostic = Win32Error("Cannot create ADB input pipe");
+                return false;
+            }
+            childInput.reset(inputRead);
+            const UniqueHandle parentInput(inputWrite);
+            DWORD written = 0;
+            const DWORD inputSize = static_cast<DWORD>(standardInput.size());
+            if (!WriteFile(parentInput.get(), standardInput.data(), inputSize, &written, nullptr) ||
+                written != inputSize)
+            {
+                diagnostic = Win32Error("Cannot write ADB standard input");
+                return false;
+            }
+        }
+
         STARTUPINFOW startup{};
         startup.cb = sizeof(startup);
         startup.dwFlags = STARTF_USESTDHANDLES;
-        startup.hStdInput = nullHandle.get();
+        startup.hStdInput = childInput.get() ? childInput.get() : nullHandle.get();
         startup.hStdOutput = writeHandle.get();
         startup.hStdError = captureStderr ? writeHandle.get() : nullHandle.get();
 
@@ -645,11 +643,12 @@ bool RunProcess(
 
 std::string ExecuteADB(
     const std::wstring& arguments,
-    DWORD timeoutMs = 10000)
+    DWORD timeoutMs = 10000,
+    bool automation = false)
 {
     std::vector<unsigned char> data;
     std::string diagnostic;
-    const bool success = RunProcess(ADBExecutable(), arguments, data, diagnostic, timeoutMs);
+    const bool success = RunProcess(ADBExecutable(), arguments, data, diagnostic, timeoutMs, true, automation);
     const std::string output(data.begin(), data.end());
 
     if (success)
@@ -668,475 +667,106 @@ std::wstring DeviceArgument(const std::string& deviceId)
     return QuoteProcessArgument(Utf8ToWide(deviceId));
 }
 
-// ============================================================
-// REAL WINDOWS INPUT (VISIBLE MOUSE + KEYBOARD)
-// ============================================================
-
-HWND GetMappedEmulatorWindow(const std::string& deviceId)
+bool LaunchPhotonOnDevice(const std::string& deviceId, std::string& output, bool automation = false)
 {
-    std::lock_guard<std::mutex> lock(g_DeviceWindowMapMutex);
-    auto it = g_DeviceWindowMap.find(deviceId);
-
-    if (it == g_DeviceWindowMap.end())
-        return nullptr;
-
-    const WindowIdentity& identity = it->second;
-    DWORD processId = 0;
-    GetWindowThreadProcessId(identity.handle, &processId);
-    return processId && processId == identity.processId ? identity.handle : nullptr;
+    output = ExecuteADB(L"-s " + DeviceArgument(deviceId) +
+        L" shell monkey -p com.photon.top -c android.intent.category.LAUNCHER 1", 10000, automation);
+    return !IsADBError(output) && output.find("Events injected: 1") != std::string::npos;
 }
 
-struct RenderChildSearch
+// Coordinates use the normalized matching image. Keep the original size
+// with each match so a tap uses the same frame's Android coordinates.
+struct ScreenMatch
 {
-    HWND bestWindow = nullptr;
-    double bestScore = -1.0;
+    int x = 0;
+    int y = 0;
+    cv::Size originalSize;
 };
 
-BOOL CALLBACK FindRenderChildCallback(HWND hwnd, LPARAM parameter)
-{
-    auto* search = reinterpret_cast<RenderChildSearch*>(parameter);
-
-    if (!search || !IsWindowVisible(hwnd))
-        return TRUE;
-
-    RECT rc{};
-    if (!GetClientRect(hwnd, &rc))
-        return TRUE;
-
-    const int width = rc.right - rc.left;
-    const int height = rc.bottom - rc.top;
-
-    if (width < 320 || height < 180)
-        return TRUE;
-
-    const double ratio = static_cast<double>(width) /
-        static_cast<double>(height);
-
-    // The ADB screenshots are 16:9. Prefer the largest visible child
-    // whose client area resembles the actual game render surface.
-    if (ratio < 1.45 || ratio > 2.05)
-        return TRUE;
-
-    const double ratioError = std::abs(std::log(ratio / 1.7777777778));
-    const double area = static_cast<double>(width) * height;
-    const double score = area / (1.0 + ratioError * 5.0);
-
-    if (score > search->bestScore)
-    {
-        search->bestScore = score;
-        search->bestWindow = hwnd;
-    }
-
-    return TRUE;
-}
-
-HWND FindEmulatorRenderWindow(HWND topLevelWindow)
-{
-    if (!IsWindow(topLevelWindow))
-        return nullptr;
-
-    RenderChildSearch search;
-    EnumChildWindows(
-        topLevelWindow,
-        FindRenderChildCallback,
-        reinterpret_cast<LPARAM>(&search)
-    );
-
-    return search.bestWindow ? search.bestWindow : topLevelWindow;
-}
-
-bool IsForegroundEmulator(HWND window)
-{
-    const HWND foreground = GetForegroundWindow();
-    return window && foreground && GetAncestor(foreground, GA_ROOT) == window;
-}
-
-bool ActivateEmulatorWindow(
+bool RunAndroidInput(
     const std::string& deviceId,
-    HWND& topLevelWindow,
-    HWND& renderWindow,
-    std::string& diagnostic)
+    const std::wstring& command,
+    std::string& diagnostic,
+    std::string_view standardInput = {})
 {
-    if (IsAutomationCancelled())
-    {
-        diagnostic = "Input cancelled.";
-        return false;
-    }
+    std::vector<unsigned char> output;
+    const bool succeeded = RunProcess(ADBExecutable(), L"-s " + DeviceArgument(deviceId) + command,
+        output, diagnostic, 8000, true, true, standardInput);
 
-    topLevelWindow = GetMappedEmulatorWindow(deviceId);
-
-    if (!topLevelWindow || !IsWindow(topLevelWindow))
+    if (!standardInput.empty())
     {
-        diagnostic =
-            "No valid LDPlayer window is mapped to ADB device " +
-            deviceId +
-            ". Assign the matching window in Emulator Manager.";
-        return false;
-    }
-
-    if (IsHungAppWindow(topLevelWindow))
-    {
-        diagnostic = "The assigned LDPlayer window is not responding.";
-        return false;
-    }
-
-    if (IsIconic(topLevelWindow))
-    {
-        ShowWindowAsync(topLevelWindow, SW_RESTORE);
-        for (int attempt = 0; attempt < 25 && IsIconic(topLevelWindow); ++attempt)
+        // Android's error output may contain the text that it was asked to type.
+        if (succeeded && !Trim(std::string(output.begin(), output.end())).empty())
         {
-            if (!PauseAutomation(20))
-            {
-                diagnostic = "Input cancelled while restoring LDPlayer.";
-                return false;
-            }
-        }
-        if (IsIconic(topLevelWindow))
-        {
-            diagnostic = "Could not restore the minimized LDPlayer window.";
+            diagnostic = "Android shell reported an error while entering text.";
             return false;
         }
+        return succeeded;
     }
 
-    // Recalculate the actual game surface for every action. The user may
-    // freely move or resize LDPlayer windows while automation is running.
-    renderWindow = FindEmulatorRenderWindow(topLevelWindow);
-
-    if (!renderWindow || !IsWindow(renderWindow))
+    const std::string response = Trim(std::string(output.begin(), output.end()));
+    if (!response.empty())
     {
-        diagnostic = "Could not find the LDPlayer render area.";
+        if (!diagnostic.empty())
+            diagnostic += " ";
+        diagnostic += response;
         return false;
     }
-
-    SetWindowPos(
-        topLevelWindow,
-        HWND_TOP,
-        0, 0, 0, 0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS
-    );
-
-    // Ensure this worker thread has a message queue before attaching input.
-    MSG queueMessage{};
-    PeekMessageW(
-        &queueMessage,
-        nullptr,
-        WM_USER,
-        WM_USER,
-        PM_NOREMOVE
-    );
-
-    const HWND previousForeground = GetForegroundWindow();
-    const DWORD foregroundThreadId = previousForeground
-        ? GetWindowThreadProcessId(previousForeground, nullptr)
-        : 0;
-    const DWORD targetThreadId =
-        GetWindowThreadProcessId(topLevelWindow, nullptr);
-    const DWORD currentThreadId = GetCurrentThreadId();
-
-    // Attach to both the current foreground queue and LDPlayer's queue.
-    // This is important when switching between several separate emulator windows.
-    bool attachedForeground = false;
-    bool attachedTarget = false;
-
-    if (foregroundThreadId != 0 &&
-        foregroundThreadId != currentThreadId)
-    {
-        attachedForeground = AttachThreadInput(
-            currentThreadId,
-            foregroundThreadId,
-            TRUE
-        ) != FALSE;
-    }
-
-    if (targetThreadId != 0 &&
-        targetThreadId != currentThreadId &&
-        targetThreadId != foregroundThreadId)
-    {
-        attachedTarget = AttachThreadInput(
-            currentThreadId,
-            targetThreadId,
-            TRUE
-        ) != FALSE;
-    }
-
-    BringWindowToTop(topLevelWindow);
-    SetForegroundWindow(topLevelWindow);
-    SetActiveWindow(topLevelWindow);
-    SetFocus(renderWindow);
-
-    Sleep(25);
-
-    if (attachedTarget)
-        AttachThreadInput(currentThreadId, targetThreadId, FALSE);
-
-    if (attachedForeground)
-        AttachThreadInput(currentThreadId, foregroundThreadId, FALSE);
-
-    if (!IsForegroundEmulator(topLevelWindow))
-    {
-        diagnostic =
-            "Foreground activation failed for this LDPlayer instance. "
-            "Mouse action cancelled rather than clicking another window.";
-        return false;
-    }
-
-    diagnostic =
-        "Focused LDPlayer HWND " +
-        std::to_string(reinterpret_cast<uintptr_t>(topLevelWindow)) +
-        ", render HWND " +
-        std::to_string(reinterpret_cast<uintptr_t>(renderWindow)) + ".";
-
-    return true;
+    return succeeded;
 }
 
-bool GetScreenPointForEmulator(
-    HWND renderWindow,
-    int x,
-    int y,
-    POINT& screenPoint,
-    std::string& diagnostic)
-{
-    RECT client{};
-    if (!GetClientRect(renderWindow, &client))
-    {
-        diagnostic = "GetClientRect failed for LDPlayer render area.";
-        return false;
-    }
-
-    const int width = client.right - client.left;
-    const int height = client.bottom - client.top;
-
-    if (width <= 0 || height <= 0)
-    {
-        diagnostic = "LDPlayer render area has invalid dimensions.";
-        return false;
-    }
-
-    POINT origin{ 0, 0 };
-    if (!ClientToScreen(renderWindow, &origin))
-    {
-        diagnostic = "ClientToScreen failed for LDPlayer render area.";
-        return false;
-    }
-
-    // Use the center of the source pixel and keep the result inside the client.
-    screenPoint.x = origin.x + static_cast<LONG>(
-        (static_cast<long long>(2 * x + 1) * width) / (2 * SCREEN_WIDTH));
-    screenPoint.y = origin.y + static_cast<LONG>(
-        (static_cast<long long>(2 * y + 1) * height) / (2 * SCREEN_HEIGHT));
-
-    return true;
-}
-
-bool IsPointOnEmulator(HWND topLevelWindow, HWND renderWindow, POINT point)
-{
-    const HWND hit = WindowFromPoint(point);
-    return IsForegroundEmulator(topLevelWindow) && hit &&
-        (hit == topLevelWindow || hit == renderWindow || IsChild(renderWindow, hit)) &&
-        GetAncestor(hit, GA_ROOT) == topLevelWindow;
-}
-
-bool ClickEmulator(
+bool TapADB(
     const std::string& deviceId,
-    int x,
-    int y,
-    DWORD holdMs,
-    bool legacyClick,
-    std::string& diagnostic)
+    const ScreenMatch& match,
+    std::string& diagnostic,
+    DWORD durationMs = 40)
 {
-    if (x < 0 || x >= SCREEN_WIDTH || y < 0 || y >= SCREEN_HEIGHT)
+    if (match.originalSize.width <= 0 || match.originalSize.height <= 0 ||
+        match.x < 0 || match.x >= SCREEN_WIDTH || match.y < 0 || match.y >= SCREEN_HEIGHT)
     {
-        diagnostic = "Invalid click coordinates.";
+        diagnostic = "Invalid Android touch coordinates.";
         return false;
     }
 
-    HWND topLevelWindow = nullptr;
-    HWND renderWindow = nullptr;
-    if (!ActivateEmulatorWindow(deviceId, topLevelWindow, renderWindow, diagnostic))
+    const auto x = (2LL * match.x + 1) * match.originalSize.width / (2 * SCREEN_WIDTH);
+    const auto y = (2LL * match.y + 1) * match.originalSize.height / (2 * SCREEN_HEIGHT);
+    const std::wstring point = std::to_wstring(x) + L" " + std::to_wstring(y);
+    // A zero-distance swipe maintains contact for the requested duration.
+    if (!RunAndroidInput(deviceId, L" shell input touchscreen swipe " + point + L" " +
+        point + L" " + std::to_wstring(durationMs), diagnostic))
         return false;
 
-    POINT point{};
-    if (!GetScreenPointForEmulator(renderWindow, x, y, point, diagnostic))
-        return false;
-
-    if (!IsPointOnEmulator(topLevelWindow, renderWindow, point))
-    {
-        diagnostic = "Click cancelled. The LDPlayer render area is covered or out of focus.";
-        return false;
-    }
-    if (!SetCursorPos(point.x, point.y))
-    {
-        diagnostic = Win32Error("Cannot position cursor for click");
-        return false;
-    }
-
-    if (holdMs > 28)
-        Sleep(35);
-
-    POINT current{};
-    if (IsAutomationCancelled() || !GetCursorPos(&current) || current.x != point.x ||
-        current.y != point.y || !IsPointOnEmulator(topLevelWindow, renderWindow, current))
-    {
-        diagnostic = "Click cancelled. The cursor or LDPlayer window changed before input.";
-        return false;
-    }
-
-    if (legacyClick)
-    {
-        mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
-        Sleep(holdMs);
-        mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
-    }
-    else
-    {
-        INPUT button{};
-        button.type = INPUT_MOUSE;
-        button.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
-        if (SendInput(1, &button, sizeof(INPUT)) != 1)
-        {
-            diagnostic = Win32Error("Cannot press left mouse button");
-            return false;
-        }
-
-        Sleep(holdMs);
-
-        button.mi.dwFlags = MOUSEEVENTF_LEFTUP;
-        if (SendInput(1, &button, sizeof(INPUT)) != 1)
-        {
-            diagnostic = Win32Error("Cannot release left mouse button");
-            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
-            return false;
-        }
-    }
-
-    diagnostic = "Mouse click at game (" + std::to_string(x) + ", " + std::to_string(y) +
-        "), desktop (" + std::to_string(point.x) + ", " + std::to_string(point.y) + ").";
+    diagnostic = "ADB touch sent at (" + std::to_string(x) + ", " + std::to_string(y) +
+        "), held for " + std::to_string(durationMs) + " ms.";
     return true;
-}
-
-bool TapLoginButton(const std::string& deviceId, int x, int y, int attempt, std::string& diagnostic)
-{
-    return ClickEmulator(deviceId, x, y, attempt == 1 ? 85 : 95, attempt > 1, diagnostic);
-}
-
-bool TapADB(const std::string& deviceId, int x, int y, std::string& diagnostic)
-{
-    return ClickEmulator(deviceId, x, y, 28, false, diagnostic);
-}
-
-bool ConfirmKeyboardTarget(const std::string& deviceId, std::string& diagnostic)
-{
-    if (IsAutomationCancelled())
-    {
-        diagnostic = "Keyboard input cancelled.";
-        return false;
-    }
-
-    const HWND window = GetMappedEmulatorWindow(deviceId);
-    if (!IsForegroundEmulator(window))
-    {
-        diagnostic = "Keyboard input cancelled. The assigned LDPlayer window lost focus.";
-        return false;
-    }
-
-    GUITHREADINFO info{};
-    info.cbSize = sizeof(info);
-    if (!GetGUIThreadInfo(0, &info) || !info.hwndFocus ||
-        GetAncestor(info.hwndFocus, GA_ROOT) != window)
-    {
-        diagnostic = "Keyboard input cancelled. Focus is outside the assigned LDPlayer window.";
-        return false;
-    }
-    return true;
-}
-
-bool SendKeyboardBatch(INPUT* events, UINT count, std::string& diagnostic)
-{
-    const UINT sent = SendInput(count, events, sizeof(INPUT));
-    if (sent == count)
-        return true;
-
-    diagnostic = Win32Error("Cannot send keyboard input");
-    for (UINT i = sent; i < count; ++i)
-    {
-        if (!(events[i].ki.dwFlags & KEYEVENTF_KEYUP))
-            continue;
-
-        for (UINT j = 0; j < sent; ++j)
-        {
-            if (events[j].ki.wVk == events[i].ki.wVk && events[j].ki.wScan == events[i].ki.wScan &&
-                !(events[j].ki.dwFlags & KEYEVENTF_KEYUP))
-            {
-                SendInput(1, &events[i], sizeof(INPUT));
-                break;
-            }
-        }
-    }
-    return false;
-}
-
-INPUT KeyEvent(WORD virtualKey, bool keyUp = false)
-{
-    INPUT event{};
-    event.type = INPUT_KEYBOARD;
-    event.ki.wVk = virtualKey;
-    if (keyUp)
-        event.ki.dwFlags = KEYEVENTF_KEYUP;
-    return event;
-}
-
-bool SendHeldKey(WORD virtualKey, DWORD holdMs, std::string& diagnostic)
-{
-    INPUT down = KeyEvent(virtualKey);
-    if (!SendKeyboardBatch(&down, 1, diagnostic))
-        return false;
-
-    Sleep(holdMs);
-
-    INPUT up = KeyEvent(virtualKey, true);
-    if (SendKeyboardBatch(&up, 1, diagnostic))
-        return true;
-
-    SendInput(1, &up, sizeof(INPUT));
-    return false;
 }
 
 bool ClearADBTextField(
     const std::string& deviceId,
-    int x,
-    int y,
+    const ScreenMatch& match,
     std::string& diagnostic)
 {
-    if (!TapADB(deviceId, x, y, diagnostic))
+    if (!TapADB(deviceId, match, diagnostic))
         return false;
-
-    Sleep(25);
-    INPUT selectAll[] = { KeyEvent(VK_CONTROL), KeyEvent('A'), KeyEvent('A', true), KeyEvent(VK_CONTROL, true) };
-    if (!ConfirmKeyboardTarget(deviceId, diagnostic) || !SendKeyboardBatch(selectAll, 4, diagnostic))
-        return false;
-
-    if (!ConfirmKeyboardTarget(deviceId, diagnostic) || !SendHeldKey(VK_BACK, 35, diagnostic))
-        return false;
-
-    Sleep(18);
-    INPUT end[] = { KeyEvent(VK_END), KeyEvent(VK_END, true) };
-    if (!ConfirmKeyboardTarget(deviceId, diagnostic) || !SendKeyboardBatch(end, 2, diagnostic))
-        return false;
-
-    // Some controls ignore Ctrl+A. Keep the existing fallback for short names.
-    for (int i = 0; i < 24; ++i)
+    if (!PauseAutomation(350))
     {
-        if (!ConfirmKeyboardTarget(deviceId, diagnostic) || !SendHeldKey(VK_BACK, 28, diagnostic))
-            return false;
-        Sleep(12);
+        diagnostic = "Field clearing cancelled.";
+        return false;
     }
 
-    diagnostic = "Cleared the focused name field.";
+    std::wstring command = L" shell input keyevent KEYCODE_MOVE_END";
+    for (int i = 0; i < 64; ++i)
+        command += L" KEYCODE_DEL";
+
+    if (!RunAndroidInput(deviceId, command, diagnostic))
+        return false;
+
+    diagnostic = "ADB clear sent to the focused name field.";
     return true;
 }
 
 // Generated names and configured passwords are restricted to ASCII letters/digits,
-// which can be translated reliably into ordinary Windows keyboard scan codes.
+// so the value is safe to send as a single Android shell argument.
 bool IsSafeADBText(const std::string& value)
 {
     if (value.empty())
@@ -1160,101 +790,16 @@ bool InputADBText(
 {
     if (!IsSafeADBText(value))
     {
-        diagnostic =
-            "Text contains unsupported characters. "
-            "Use English letters and digits only.";
+        diagnostic = "Use English letters and digits only.";
         return false;
     }
 
-    if (!ConfirmKeyboardTarget(deviceId, diagnostic))
+    // Pass the text through stdin so it is absent from the Windows process arguments.
+    const std::string command = "input text '" + value + "'\n";
+    if (!RunAndroidInput(deviceId, L" shell -T sh", diagnostic, command))
         return false;
 
-    const HKL layout = GetKeyboardLayout(GetWindowThreadProcessId(GetMappedEmulatorWindow(deviceId), nullptr));
-    const std::wstring text = Utf8ToWide(value);
-
-    // Validate the full string before pressing any key.
-    std::vector<SHORT> mappings;
-    mappings.reserve(text.size());
-    for (wchar_t character : text)
-    {
-        const SHORT mapping = VkKeyScanExW(character, layout);
-        if (mapping == -1 || (HIBYTE(mapping) & ~7) != 0)
-        {
-            diagnostic = "Switch the LDPlayer window to an English keyboard layout before starting automation.";
-            return false;
-        }
-        mappings.push_back(mapping);
-    }
-
-    for (SHORT mapping : mappings)
-    {
-        if (!ConfirmKeyboardTarget(deviceId, diagnostic))
-            return false;
-
-        const WORD virtualKey = LOBYTE(mapping);
-        const BYTE modifiers = HIBYTE(mapping);
-        bool needShift = (modifiers & 1) != 0;
-        const bool needControl = (modifiers & 2) != 0;
-        const bool needAlt = (modifiers & 4) != 0;
-        if (virtualKey >= 'A' && virtualKey <= 'Z' && (GetKeyState(VK_CAPITAL) & 1))
-            needShift = !needShift;
-
-        std::array<INPUT, 8> events{};
-        UINT count = 0;
-        const auto appendScanCode = [&](WORD key, bool keyUp)
-        {
-            const UINT scanCode = MapVirtualKeyExW(key, MAPVK_VK_TO_VSC_EX, layout);
-            INPUT& event = events[count++];
-            event.type = INPUT_KEYBOARD;
-            event.ki.wScan = static_cast<WORD>(scanCode & 0xFF);
-            event.ki.dwFlags = KEYEVENTF_SCANCODE;
-            if ((scanCode & 0xFF00) == 0xE000)
-                event.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
-            if (keyUp)
-                event.ki.dwFlags |= KEYEVENTF_KEYUP;
-        };
-
-        if (needControl)
-            appendScanCode(VK_CONTROL, false);
-        if (needAlt)
-            appendScanCode(VK_MENU, false);
-        if (needShift)
-            appendScanCode(VK_SHIFT, false);
-
-        appendScanCode(virtualKey, false);
-        appendScanCode(virtualKey, true);
-
-        if (needShift)
-            appendScanCode(VK_SHIFT, true);
-        if (needAlt)
-            appendScanCode(VK_MENU, true);
-        if (needControl)
-            appendScanCode(VK_CONTROL, true);
-
-        for (UINT i = 0; i < count; ++i)
-        {
-            if (events[i].ki.wScan == 0)
-            {
-                diagnostic = "The LDPlayer keyboard layout has an unsupported scan code.";
-                return false;
-            }
-        }
-
-        if (!SendKeyboardBatch(events.data(), count, diagnostic))
-            return false;
-
-        if (!PauseAutomation(75))
-        {
-            diagnostic = "Keyboard input cancelled.";
-            return false;
-        }
-    }
-
-    diagnostic =
-        "REAL WINDOWS KEYBOARD: sent " +
-        std::to_string(text.size()) +
-        " scan-code key presses through SendInput.";
-
+    diagnostic = "ADB text input sent.";
     return true;
 }
 
@@ -1578,7 +1123,7 @@ bool DecodeImage(
     const std::vector<unsigned char>& data,
     cv::Mat& image,
     std::string& diagnostic,
-    cv::Size* originalSize)
+    cv::Size& originalSize)
 {
     image.release();
 
@@ -1598,8 +1143,7 @@ bool DecodeImage(
             return false;
         }
 
-        if (originalSize)
-            *originalSize = image.size();
+        originalSize = image.size();
 
         if (image.cols != SCREEN_WIDTH ||
             image.rows != SCREEN_HEIGHT)
@@ -1633,7 +1177,7 @@ bool CaptureADBScreenshot(
     cv::Mat& screen,
     std::string& diagnostic,
     ULONGLONG deadline,
-    cv::Size* originalSize = nullptr)
+    cv::Size& originalSize)
 {
     constexpr DWORD maxCaptureMs = 4000;
     const DWORD timeout = std::min(maxCaptureMs, RemainingTime(deadline));
@@ -1657,12 +1201,12 @@ bool DetectPhotonTemplate(
     const std::string& deviceId,
     const cv::Mat& templateImage,
     double& confidence,
-    POINT& matchCenter,
+    ScreenMatch& matchCenter,
     std::string& diagnostic,
     ULONGLONG deadline)
 {
     confidence = 0.0;
-    matchCenter = { 0, 0 };
+    matchCenter = {};
     diagnostic.clear();
 
     if (templateImage.empty())
@@ -1674,7 +1218,7 @@ bool DetectPhotonTemplate(
     try
     {
         cv::Mat screenshot;
-        if (!CaptureADBScreenshot(deviceId, screenshot, diagnostic, deadline))
+        if (!CaptureADBScreenshot(deviceId, screenshot, diagnostic, deadline, matchCenter.originalSize))
             return false;
 
         if (templateImage.cols > screenshot.cols ||
@@ -1745,7 +1289,7 @@ bool DetectPhotonTemplate(
 bool DetectPhotonReady(
     const std::string& deviceId,
     double& confidence,
-    POINT& center,
+    ScreenMatch& center,
     std::string& diagnostic)
 {
     return DetectPhotonTemplate(
@@ -1759,12 +1303,12 @@ bool DetectInputField(
     const std::string& deviceId,
     const std::string& templateName,
     double& confidence,
-    POINT& center,
+    ScreenMatch& center,
     std::string& diagnostic,
     ULONGLONG deadline)
 {
     confidence = 0.0;
-    center = { 0, 0 };
+    center = {};
 
     auto it = g_StageTemplates.find(templateName);
     if (it == g_StageTemplates.end() || it->second.empty())
@@ -1774,7 +1318,7 @@ bool DetectInputField(
     }
 
     cv::Mat screenshot;
-    if (!CaptureADBScreenshot(deviceId, screenshot, diagnostic, deadline))
+    if (!CaptureADBScreenshot(deviceId, screenshot, diagnostic, deadline, center.originalSize))
         return false;
 
     try
@@ -1861,23 +1405,24 @@ bool DetectInputField(
     }
 }
 
-bool MatchesAreStable(POINT previous, POINT current)
+bool MatchesAreStable(ScreenMatch previous, ScreenMatch current)
 {
     constexpr LONG maxMovement = 12;
-    return std::abs(previous.x - current.x) <= maxMovement &&
+    return previous.originalSize == current.originalSize &&
+        std::abs(previous.x - current.x) <= maxMovement &&
         std::abs(previous.y - current.y) <= maxMovement;
 }
 
 bool WaitForInputField(
     const std::string& deviceId,
     const std::string& templateName,
-    POINT& center,
+    ScreenMatch& center,
     std::string& diagnostic,
     int timeoutMs)
 {
     const ULONGLONG deadline = GetTickCount64() + timeoutMs;
     constexpr size_t previousFrameCount = 4;
-    std::array<POINT, previousFrameCount> previousCenters{};
+    std::array<ScreenMatch, previousFrameCount> previousCenters{};
     std::array<bool, previousFrameCount> previousMatches{};
     size_t nextIndex = 0;
     double bestConfidence = -1.0;
@@ -1886,7 +1431,7 @@ bool WaitForInputField(
 
     while (!IsAutomationCancelled() && RemainingTime(deadline))
     {
-        POINT currentCenter{};
+        ScreenMatch currentCenter{};
         double confidence = 0.0;
         const bool found = DetectInputField(
             deviceId, templateName, confidence, currentCenter, lastDiagnostic, deadline);
@@ -1931,11 +1476,11 @@ bool WaitForTemplate(
     int requiredMatches,
     Detect detect,
     double& confidence,
-    POINT& center,
+    ScreenMatch& center,
     std::string& diagnostic)
 {
     const ULONGLONG deadline = GetTickCount64() + timeoutMs;
-    POINT previousCenter{};
+    ScreenMatch previousCenter{};
     int consecutive = 0;
     std::string lastDiagnostic;
     confidence = 0.0;
@@ -1943,7 +1488,7 @@ bool WaitForTemplate(
 
     while (!IsAutomationCancelled() && RemainingTime(deadline))
     {
-        POINT currentCenter{};
+        ScreenMatch currentCenter{};
         const bool found = detect(confidence, currentCenter, lastDiagnostic, deadline);
         if (found && !IsAutomationCancelled() && RemainingTime(deadline))
         {
@@ -1976,12 +1521,12 @@ bool WaitForTemplate(
 bool WaitForPhotonReady(
     const std::string& deviceId,
     double& confidence,
-    POINT& center,
+    ScreenMatch& center,
     std::string& diagnostic,
     int timeoutMs)
 {
     return WaitForTemplate("Login screen", timeoutMs, 1,
-        [&](double& score, POINT& point, std::string& last, ULONGLONG deadline)
+        [&](double& score, ScreenMatch& point, std::string& last, ULONGLONG deadline)
         {
             return DetectPhotonTemplate(deviceId, g_PhotonReadyTemplate, score, point, last, deadline);
         },
@@ -2000,9 +1545,9 @@ bool WaitForPhotonAfterLogin(
         return false;
     }
 
-    POINT center{};
+    ScreenMatch center{};
     return WaitForTemplate("After-login screen", timeoutMs, 1,
-        [&](double& score, POINT& point, std::string& last, ULONGLONG deadline)
+        [&](double& score, ScreenMatch& point, std::string& last, ULONGLONG deadline)
         {
             return DetectPhotonTemplate(deviceId, g_PhotonAfterLoginTemplate, score, point, last, deadline);
         },
@@ -2012,7 +1557,7 @@ bool WaitForPhotonAfterLogin(
 bool WaitForStage(
     const std::string& deviceId,
     const std::string& templateName,
-    POINT& center,
+    ScreenMatch& center,
     std::string& diagnostic,
     int timeoutMs = STAGE_TIMEOUT_MS)
 {
@@ -2025,7 +1570,7 @@ bool WaitForStage(
 
     double confidence = 0.0;
     return WaitForTemplate(templateName + ".png", timeoutMs, 2,
-        [&](double& score, POINT& point, std::string& last, ULONGLONG deadline)
+        [&](double& score, ScreenMatch& point, std::string& last, ULONGLONG deadline)
         {
             return DetectPhotonTemplate(deviceId, stage->second, score, point, last, deadline);
         },
@@ -2039,7 +1584,7 @@ bool WaitAndTapStage(
 {
     log << "\nWAITING FOR " << templateName << ".png\n";
 
-    POINT center{};
+    ScreenMatch center{};
     std::string diagnostic;
 
     if (!WaitForStage(
@@ -2065,8 +1610,7 @@ bool WaitAndTapStage(
 
     if (!TapADB(
         deviceId,
-        center.x,
-        center.y,
+        center,
         tapDiagnostic))
     {
         log << "TAP ERROR: " << tapDiagnostic << "\n";
@@ -2089,13 +1633,12 @@ bool DetectPhotonMarkerTemplate(
     const std::string& deviceId,
     const cv::Mat& templateImage,
     double& confidence,
-    POINT& matchCenter,
+    ScreenMatch& matchCenter,
     std::string& diagnostic,
-    ULONGLONG deadline,
-    cv::Size& originalSize)
+    ULONGLONG deadline)
 {
     confidence = 0.0;
-    matchCenter = { 0, 0 };
+    matchCenter = {};
 
     if (templateImage.empty())
     {
@@ -2104,7 +1647,7 @@ bool DetectPhotonMarkerTemplate(
     }
 
     cv::Mat screenshot;
-    if (!CaptureADBScreenshot(deviceId, screenshot, diagnostic, deadline, &originalSize))
+    if (!CaptureADBScreenshot(deviceId, screenshot, diagnostic, deadline, matchCenter.originalSize))
         return false;
 
     try
@@ -2262,44 +1805,6 @@ bool LoadExternalTemplate(
     return false;
 }
 
-bool TapPhotonMarker(
-    const std::string& deviceId,
-    POINT center,
-    cv::Size originalSize,
-    std::string& diagnostic)
-{
-    if (originalSize.width <= 0 || originalSize.height <= 0 ||
-        center.x < 0 || center.x >= SCREEN_WIDTH || center.y < 0 || center.y >= SCREEN_HEIGHT)
-    {
-        diagnostic = "Invalid PHOTON marker touch coordinates.";
-        return false;
-    }
-
-    const auto x = (2LL * center.x + 1) * originalSize.width / (2 * SCREEN_WIDTH);
-    const auto y = (2LL * center.y + 1) * originalSize.height / (2 * SCREEN_HEIGHT);
-    const std::wstring arguments = L"-s " + DeviceArgument(deviceId) +
-        L" shell input touchscreen tap " + std::to_wstring(x) + L" " + std::to_wstring(y);
-
-    std::vector<unsigned char> output;
-    const bool succeeded = RunProcess(ADBExecutable(), arguments, output, diagnostic, 5000, true, true);
-    const std::string response = Trim(std::string(output.begin(), output.end()));
-    // Android's input command may print an error even when the shell returns zero.
-    if (!succeeded || !response.empty())
-    {
-        if (!response.empty())
-        {
-            if (!diagnostic.empty())
-                diagnostic += " ";
-            diagnostic += response;
-        }
-        return false;
-    }
-
-    diagnostic = "ADB touchscreen tap sent for PHOTON marker at (" + std::to_string(x) +
-        ", " + std::to_string(y) + ").";
-    return true;
-}
-
 bool RunPostAutomationImageSequence(
     const std::string& deviceId,
     std::ostream& log)
@@ -2318,12 +1823,11 @@ bool RunPostAutomationImageSequence(
     }
 
     double score = 0.0;
-    POINT center{};
+    ScreenMatch center{};
     std::string diagnostic;
-    cv::Size originalSize;
-    const auto detectMarker = [&](double& confidence, POINT& point, std::string& last, ULONGLONG deadline)
+    const auto detectMarker = [&](double& confidence, ScreenMatch& point, std::string& last, ULONGLONG deadline)
     {
-        return DetectPhotonMarkerTemplate(deviceId, templates[0], confidence, point, last, deadline, originalSize);
+        return DetectPhotonMarkerTemplate(deviceId, templates[0], confidence, point, last, deadline);
     };
     log << "Waiting for photon_marker\n";
     if (!WaitForTemplate(names[0], STAGE_TIMEOUT_MS, 2, detectMarker, score, center, diagnostic))
@@ -2332,15 +1836,15 @@ bool RunPostAutomationImageSequence(
         return false;
     }
     log << diagnostic << "\n";
-    const POINT tappedCenter = center;
-    const bool pressed = ClickEmulator(deviceId, center.x, center.y, 160, false, diagnostic);
-    log << (pressed ? "Marker mouse press (160 ms). " : "Marker mouse press failed. ") << diagnostic << "\n";
+    const ScreenMatch tappedCenter = center;
+    const bool pressed = TapADB(deviceId, center, diagnostic, 160);
+    log << (pressed ? "Marker touch (160 ms). " : "Marker touch failed. ") << diagnostic << "\n";
 
     for (size_t i = 1; i < names.size(); ++i)
     {
         log << "Waiting for " << names[i] << "\n";
         std::string lastImageMatch;
-        const auto detectTarget = [&](double& confidence, POINT& point, std::string& last, ULONGLONG deadline)
+        const auto detectTarget = [&](double& confidence, ScreenMatch& point, std::string& last, ULONGLONG deadline)
         {
             const bool found = DetectPhotonTemplate(deviceId, templates[i], confidence, point, last, deadline);
             if (last.rfind("Match: ", 0) == 0)
@@ -2352,7 +1856,7 @@ bool RunPostAutomationImageSequence(
         if (i == 1 && !found && !IsAutomationCancelled())
         {
             log << diagnostic << "\n";
-            POINT markerCenter{};
+            ScreenMatch markerCenter{};
             std::string markerDiagnostic;
             if (WaitForTemplate(names[0], 4500, 2, detectMarker, score, markerCenter, markerDiagnostic) &&
                 MatchesAreStable(tappedCenter, markerCenter))
@@ -2363,9 +1867,9 @@ bool RunPostAutomationImageSequence(
                     found = WaitForTemplate(names[i], 4500, 2, detectTarget, score, center, diagnostic);
                 else if (diagnostic.rfind("Match: ", 0) == 0 && !IsAutomationCancelled())
                 {
-                    log << "Marker still visible. Trying an ADB touchscreen tap.\n";
-                    const bool tapSent = TapPhotonMarker(deviceId, markerCenter, originalSize, diagnostic);
-                    log << (tapSent ? "" : "ADB marker tap failed. ") << diagnostic << "\n";
+                    log << "Marker still visible. Trying a 240 ms Android touch.\n";
+                    const bool tapSent = TapADB(deviceId, markerCenter, diagnostic, 240);
+                    log << (tapSent ? "" : "ADB marker touch failed. ") << diagnostic << "\n";
                 }
             }
             else
@@ -2385,7 +1889,7 @@ bool RunPostAutomationImageSequence(
         }
 
         log << diagnostic << "\n";
-        if (!TapADB(deviceId, center.x, center.y, diagnostic))
+        if (!TapADB(deviceId, center, diagnostic))
         {
             log << "Click failed. " << diagnostic << "\n";
             return false;
@@ -2824,18 +2328,27 @@ AutomationResult RunPhotonAutomation(
     log << "\n[1] WAITING FOR LOGIN BUTTON\n";
 
     double confidence = 0.0;
-    POINT loginCenter{};
+    ScreenMatch loginCenter{};
     std::string diagnostic;
 
-    if (!WaitForPhotonReady(
-        device.id,
-        confidence,
-        loginCenter,
-        diagnostic,
-        LOGIN_TIMEOUT_MS))
+    if (!DetectPhotonReady(device.id, confidence, loginCenter, diagnostic))
     {
-        log << "FAILED: " << diagnostic << "\n";
-        return result;
+        if (IsAutomationCancelled())
+            return result;
+
+        log << "Opening PHOTON on " << device.id << " via ADB.\n";
+        std::string launchOutput;
+        if (!LaunchPhotonOnDevice(device.id, launchOutput, true))
+        {
+            log << "PHOTON launch could not be confirmed. " << Trim(launchOutput) << "\n";
+            return result;
+        }
+
+        if (!WaitForPhotonReady(device.id, confidence, loginCenter, diagnostic, LOGIN_TIMEOUT_MS))
+        {
+            log << "FAILED: " << diagnostic << "\n";
+            return result;
+        }
     }
 
     log << diagnostic << "\n";
@@ -2848,7 +2361,7 @@ AutomationResult RunPhotonAutomation(
 
     // Refresh the coordinates immediately before clicking.
     double freshLoginConfidence = 0.0;
-    POINT freshLoginCenter{};
+    ScreenMatch freshLoginCenter{};
     std::string freshLoginDiagnostic;
 
     if (!DetectPhotonReady(
@@ -2868,23 +2381,18 @@ AutomationResult RunPhotonAutomation(
 
     bool afterDetected = false;
     bool firstNameFieldConfirmed = false;
-    POINT firstNameCenter{};
+    ScreenMatch firstNameCenter{};
     std::string firstNameFieldDiagnostic;
 
     for (int attempt = 1; attempt <= 2; ++attempt)
     {
         log
             << "Login attempt "
-            << attempt << "/2 using dedicated login-button mouse method\n";
+            << attempt << "/2 using Android touch\n";
 
         std::string tapDiagnostic;
 
-        if (!TapLoginButton(
-            device.id,
-            loginCenter.x,
-            loginCenter.y,
-            attempt,
-            tapDiagnostic))
+        if (!TapADB(device.id, loginCenter, tapDiagnostic, attempt == 1 ? 85 : 95))
         {
             log << "ERROR: " << tapDiagnostic << "\n";
             return result;
@@ -2937,7 +2445,7 @@ AutomationResult RunPhotonAutomation(
         if (attempt == 1)
         {
             double retryConfidence = 0.0;
-            POINT retryCenter{};
+            ScreenMatch retryCenter{};
             std::string retryDiagnostic;
 
             const bool stillVisible = DetectPhotonReady(
@@ -3017,8 +2525,7 @@ AutomationResult RunPhotonAutomation(
 
     if (!ClearADBTextField(
         device.id,
-        firstNameCenter.x,
-        firstNameCenter.y,
+        firstNameCenter,
         nameDiagnostic))
     {
         log << "FIRST NAME FIELD CLEAR ERROR: " << nameDiagnostic << "\n";
@@ -3047,7 +2554,7 @@ AutomationResult RunPhotonAutomation(
     log << "\n[4] FIND LAST-NAME FIELD FROM enter_lastname.png\n";
 
     std::string surnameDiagnostic;
-    POINT lastNameCenter{};
+    ScreenMatch lastNameCenter{};
 
     if (!WaitForInputField(
         device.id,
@@ -3066,8 +2573,7 @@ AutomationResult RunPhotonAutomation(
 
     if (!ClearADBTextField(
         device.id,
-        lastNameCenter.x,
-        lastNameCenter.y,
+        lastNameCenter,
         surnameDiagnostic))
     {
         log << "LAST NAME FIELD CLEAR ERROR: " << surnameDiagnostic << "\n";
@@ -3145,7 +2651,7 @@ AutomationResult RunPhotonAutomation(
 
     log << "\n[8] WAIT FOR PASSWORD FIELD\n";
 
-    POINT passwordCenter{};
+    ScreenMatch passwordCenter{};
     std::string passwordDiagnostic;
 
     if (!WaitForStage(
@@ -3162,8 +2668,7 @@ AutomationResult RunPhotonAutomation(
 
     if (!TapADB(
         device.id,
-        passwordCenter.x,
-        passwordCenter.y,
+        passwordCenter,
         inputDiagnostic))
     {
         log << "PASSWORD FIELD TAP ERROR: "
@@ -3193,7 +2698,7 @@ AutomationResult RunPhotonAutomation(
 
     log << "\n[9] WAIT FOR PASSWORD REPEAT FIELD\n";
 
-    POINT repeatCenter{};
+    ScreenMatch repeatCenter{};
     std::string repeatDiagnostic;
 
     if (!WaitForStage(
@@ -3210,8 +2715,7 @@ AutomationResult RunPhotonAutomation(
 
     if (!TapADB(
         device.id,
-        repeatCenter.x,
-        repeatCenter.y,
+        repeatCenter,
         inputDiagnostic))
     {
         log << "REPEAT FIELD TAP ERROR: "
@@ -3220,7 +2724,6 @@ AutomationResult RunPhotonAutomation(
     }
 
     // The repeat-password screen can animate for roughly two seconds.
-    // Wait before typing and do not reactivate the window after tapping the field.
     if (!PauseAutomation(1400))
         return result;
 
@@ -3301,7 +2804,7 @@ std::string RunAutomationBatch(const std::vector<ADBDevice>& devices, const std:
 
     LivePhotonLogBuffer logBuffer;
     std::ostream log(&logBuffer);
-    log << "Devices are processed sequentially because Windows input is shared.\n";
+    log << "Selected devices are processed sequentially via ADB.\n";
 
     for (size_t i = 0; i < devices.size() && !IsAutomationCancelled(); ++i)
     {
@@ -3411,58 +2914,8 @@ void StartPhotonAutomation()
         return;
     }
 
-    // A single selected window is a convenient default for a single device.
-    if (selectedDevices.size() == 1 &&
-        !IsWindow(selectedDevices[0].automationWindow) &&
-        g_SelectedWindow >= 0 &&
-        g_SelectedWindow < static_cast<int>(g_EmulatorWindows.size()))
-    {
-        selectedDevices[0].automationWindow =
-            g_EmulatorWindows[g_SelectedWindow].handle;
-    }
-
-    // Validate all explicit device-to-window mappings before starting.
-    std::vector<HWND> usedWindows;
-
-    for (const ADBDevice& device : selectedDevices)
-    {
-        if (device.status != "device")
-            continue;
-
-        const bool listed = std::any_of(g_EmulatorWindows.begin(), g_EmulatorWindows.end(),
-            [&](const EmulatorWindow& window) { return window.handle == device.automationWindow; });
-        if (!listed || !IsWindow(device.automationWindow))
-        {
-            g_Notification =
-                "Assign an LDPlayer window to each selected ADB device "
-                "in Emulator Manager.";
-
-            AppendPhotonLog(
-                "[START BLOCKED] No valid LDPlayer window assigned to device " +
-                device.id + ".\n"
-            );
-            return;
-        }
-
-        if (std::find(
-            usedWindows.begin(),
-            usedWindows.end(),
-            device.automationWindow) != usedWindows.end())
-        {
-            g_Notification =
-                "Each selected ADB device must use a different LDPlayer window.";
-
-            AppendPhotonLog(
-                "[START BLOCKED] The same LDPlayer window is assigned to more "
-                "than one selected ADB device.\n"
-            );
-            return;
-        }
-
-        usedWindows.push_back(device.automationWindow);
-    }
-
-    if (usedWindows.empty())
+    if (std::none_of(selectedDevices.begin(), selectedDevices.end(),
+        [](const ADBDevice& device) { return device.status == "device"; }))
     {
         g_Notification = "Select at least one ready ADB device.";
         AppendPhotonLog("[START BLOCKED] No selected device is ready.\n");
@@ -3477,20 +2930,7 @@ void StartPhotonAutomation()
         std::lock_guard<std::mutex> lock(g_LogMutex);
         g_PhotonDetectionLog.clear();
         g_PhotonDetectionLog =
-            "Starting PHOTON automation with REAL WINDOWS INPUT...\n";
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(g_DeviceWindowMapMutex);
-        g_DeviceWindowMap.clear();
-
-        for (const ADBDevice& device : selectedDevices)
-        {
-            WindowIdentity identity;
-            identity.handle = device.automationWindow;
-            GetWindowThreadProcessId(identity.handle, &identity.processId);
-            g_DeviceWindowMap.emplace(device.id, identity);
-        }
+            "Starting PHOTON background automation via ADB...\n";
     }
 
     g_CancelAutomation = false;
@@ -3568,7 +3008,6 @@ void ApplyADBDeviceList(std::string output)
         if (previous != g_Devices.end())
         {
             device.selected = previous->selected;
-            device.automationWindow = previous->automationWindow;
         }
         refreshed.push_back(std::move(device));
     }
@@ -3655,12 +3094,10 @@ void LaunchPhotonOnSelectedDevices()
                     continue;
                 }
 
-                const std::string output = ExecuteADB(
-                    L"-s " + DeviceArgument(device.id) +
-                    L" shell monkey -p com.photon.top -c android.intent.category.LAUNCHER 1");
+                std::string output;
+                const bool success = LaunchPhotonOnDevice(device.id, output);
                 log << (output.empty() ? "ADB returned empty output." : Trim(output)) << "\n";
-                if (!IsADBError(output) &&
-                    output.find("Events injected: 1") != std::string::npos)
+                if (success)
                 {
                     ++launched;
                 }
@@ -3710,72 +3147,6 @@ void PollBackgroundJobs()
             g_ADBStatus = "ADB error";
         g_Notification = std::string("ADB background task failed: ") + error.what();
     }
-}
-
-// ============================================================
-// WINDOW ENUMERATION
-// ============================================================
-
-BOOL CALLBACK EnumEmulatorWindows(HWND hwnd, LPARAM)
-{
-    if (!IsWindowVisible(hwnd))
-        return TRUE;
-
-    int length = GetWindowTextLengthW(hwnd);
-
-    if (length <= 0)
-        return TRUE;
-
-    std::wstring title(
-        static_cast<size_t>(length) + 1,
-        L'\0'
-    );
-
-    const int copied = GetWindowTextW(hwnd, title.data(), length + 1);
-    if (copied <= 0)
-        return TRUE;
-    title.resize(static_cast<size_t>(copied));
-
-    bool isEmulator =
-        ContainsIgnoreCase(title, L"LDPlayer") ||
-        ContainsIgnoreCase(title, L"雷电模拟器");
-
-    if (!isEmulator)
-        return TRUE;
-
-    EmulatorWindow item;
-    item.handle = hwnd;
-    item.title = title;
-
-    g_EmulatorWindows.push_back(item);
-
-    return TRUE;
-}
-
-void RefreshEmulatorWindows()
-{
-    const HWND previouslySelected =
-        g_SelectedWindow >= 0 && g_SelectedWindow < static_cast<int>(g_EmulatorWindows.size())
-        ? g_EmulatorWindows[g_SelectedWindow].handle : nullptr;
-    g_EmulatorWindows.clear();
-    g_SelectedWindow = -1;
-
-    EnumWindows(EnumEmulatorWindows, 0);
-    for (size_t i = 0; i < g_EmulatorWindows.size(); ++i)
-    {
-        if (g_EmulatorWindows[i].handle == previouslySelected)
-            g_SelectedWindow = static_cast<int>(i);
-    }
-    if (g_EmulatorWindows.size() == 1)
-        g_SelectedWindow = 0;
-
-    g_Notification = "Emulator windows refreshed";
-}
-
-void RefreshEverything()
-{
-    RefreshEmulatorWindows();
-    RefreshADBDevices();
 }
 
 // ============================================================
@@ -3904,20 +3275,12 @@ void DrawDashboard()
         "SmartClick control center"
     );
 
-    ImGui::Columns(3, nullptr, false);
+    ImGui::Columns(2, nullptr, false);
 
     DrawStatCard(
         "ADB DEVICES",
         std::to_string(g_Devices.size()).c_str(),
         "Detected devices"
-    );
-
-    ImGui::NextColumn();
-
-    DrawStatCard(
-        "EMULATOR WINDOWS",
-        std::to_string(g_EmulatorWindows.size()).c_str(),
-        "Detected windows"
     );
 
     ImGui::NextColumn();
@@ -3941,18 +3304,8 @@ void DrawDashboard()
     ImGui::Text("Quick actions");
     ImGui::Spacing();
 
-    if (ImGui::Button("Refresh all", ImVec2(150, 35)))
-        RefreshEverything();
-
-    ImGui::SameLine();
-
     if (ImGui::Button("Refresh ADB", ImVec2(150, 35)))
         RefreshADBDevices();
-
-    ImGui::SameLine();
-
-    if (ImGui::Button("Refresh windows", ImVec2(150, 35)))
-        RefreshEmulatorWindows();
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -3972,21 +3325,11 @@ void DrawEmulatorManager()
 {
     DrawSectionTitle(
         "EMULATOR MANAGER",
-        "Manage LDPlayer windows and ADB devices"
+        "Select Android devices for background automation"
     );
-
-    if (ImGui::Button("Refresh everything", ImVec2(190, 35)))
-        RefreshEverything();
-
-    ImGui::SameLine();
 
     if (ImGui::Button("Refresh ADB", ImVec2(130, 35)))
         RefreshADBDevices();
-
-    ImGui::SameLine();
-
-    if (ImGui::Button("Refresh windows", ImVec2(150, 35)))
-        RefreshEmulatorWindows();
 
     ImGui::Spacing();
 
@@ -3997,10 +3340,7 @@ void DrawEmulatorManager()
     );
 
     ImGui::Text("ADB DEVICES");
-    ImGui::TextDisabled(
-        "Assign the matching LDPlayer window to every device. "
-        "Mouse and keyboard input will be visible on the desktop."
-    );
+    ImGui::TextDisabled("Input is sent directly to each selected Android device through ADB.");
     ImGui::Separator();
 
     int selectedCount = 0;
@@ -4066,52 +3406,6 @@ void DrawEmulatorManager()
 
             ImGui::TextDisabled("| %s", device.model.c_str());
 
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(240.0f);
-
-            std::string mappedWindowLabel = "Assign LDPlayer window";
-            for (size_t windowIndex = 0;
-                windowIndex < g_EmulatorWindows.size();
-                ++windowIndex)
-            {
-                if (g_EmulatorWindows[windowIndex].handle ==
-                    device.automationWindow)
-                {
-                    mappedWindowLabel =
-                        std::to_string(windowIndex + 1) + ". " +
-                        WideToUtf8(g_EmulatorWindows[windowIndex].title);
-                    break;
-                }
-            }
-
-            if (ImGui::BeginCombo(
-                "##ldplayer_mapping",
-                mappedWindowLabel.c_str()))
-            {
-                for (size_t windowIndex = 0;
-                    windowIndex < g_EmulatorWindows.size();
-                    ++windowIndex)
-                {
-                    const EmulatorWindow& candidate =
-                        g_EmulatorWindows[windowIndex];
-
-                    std::string option =
-                        std::to_string(windowIndex + 1) + ". " +
-                        WideToUtf8(candidate.title);
-
-                    const bool isSelected =
-                        device.automationWindow == candidate.handle;
-
-                    if (ImGui::Selectable(option.c_str(), isSelected))
-                        device.automationWindow = candidate.handle;
-
-                    if (isSelected)
-                        ImGui::SetItemDefaultFocus();
-                }
-
-                ImGui::EndCombo();
-            }
-
             ImGui::PopID();
         }
     }
@@ -4163,45 +3457,6 @@ void DrawEmulatorManager()
 
     ImGui::EndChild();
 
-    ImGui::Spacing();
-
-    ImGui::BeginChild(
-        "WindowsPanel",
-        ImVec2(0, 150),
-        true
-    );
-
-    ImGui::Text("LDPLAYER WINDOWS");
-    ImGui::Separator();
-
-    if (g_EmulatorWindows.empty())
-    {
-        ImGui::TextDisabled("No LDPlayer windows found.");
-    }
-    else
-    {
-        for (int i = 0; i < static_cast<int>(g_EmulatorWindows.size()); ++i)
-        {
-            const EmulatorWindow& currentWindow =
-                g_EmulatorWindows[i];
-
-            std::string windowLabel =
-                WideToUtf8(currentWindow.title);
-
-            ImGui::PushID(i);
-
-            if (ImGui::Selectable(
-                windowLabel.c_str(),
-                g_SelectedWindow == i))
-            {
-                g_SelectedWindow = i;
-            }
-
-            ImGui::PopID();
-        }
-    }
-
-    ImGui::EndChild();
 }
 
 // ============================================================
@@ -4393,7 +3648,7 @@ void DrawAutoLaunch()
 
     ImGui::Spacing();
 
-    ImGui::TextWrapped("Selected emulators run sequentially.");
+    ImGui::TextWrapped("Select an ADB device, then start the complete sequence in the background.");
 
     ImGui::Spacing();
 
@@ -5053,7 +4308,7 @@ int WINAPI WinMain(
     UpdateWindow(g_hWnd);
 
     LoadPhotonTemplates();
-    RefreshEverything();
+    RefreshADBDevices();
 
     MSG msg{};
     bool occluded = false;
