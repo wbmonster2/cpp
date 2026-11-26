@@ -2458,6 +2458,137 @@ bool WaitAndTapStage(
 }
 
 // ============================================================
+// POST-AUTOMATION IMAGE SEQUENCE
+// ============================================================
+
+bool WaitForAndTapExternalTemplate(
+    const std::string& deviceId,
+    const std::string& filename,
+    const std::string& displayName,
+    std::ostream& log)
+{
+    cv::Mat image;
+    std::string loadDiagnostic;
+
+    if (!LoadPhotonTemplate(
+        GetTemplatePath(Utf8ToWide(filename)),
+        image,
+        loadDiagnostic))
+    {
+        log << "POST-AUTOMATION: cannot load "
+            << filename << ": " << loadDiagnostic << "\n";
+        return false;
+    }
+
+    log << "WAITING FOR " << displayName
+        << " [" << filename << "]\n";
+
+    int consecutiveMatches = 0;
+
+    // Intentionally keep searching until this exact item appears.
+    // The next template is never checked before this one is clicked.
+    for (;;)
+    {
+        double confidence = 0.0;
+        POINT center{};
+        std::string diagnostic;
+
+        const bool found = DetectPhotonTemplate(
+            deviceId,
+            image,
+            confidence,
+            center,
+            diagnostic
+        );
+
+        if (found)
+        {
+            ++consecutiveMatches;
+
+            if (consecutiveMatches >= 2)
+            {
+                log << displayName << " detected. "
+                    << diagnostic << "\n";
+                log << "CLICKING CENTER: "
+                    << center.x << ", " << center.y << "\n";
+
+                std::string tapDiagnostic;
+
+                if (!TapADB(
+                    deviceId,
+                    center.x,
+                    center.y,
+                    tapDiagnostic))
+                {
+                    log << "CLICK FAILED: "
+                        << tapDiagnostic << "\n";
+                    return false;
+                }
+
+                log << tapDiagnostic << "\n";
+                Sleep(250);
+                return true;
+            }
+        }
+        else
+        {
+            consecutiveMatches = 0;
+        }
+
+        Sleep(DETECTION_INTERVAL_MS);
+    }
+}
+
+bool RunPostAutomationImageSequence(
+    const std::string& deviceId,
+    std::ostream& log)
+{
+    log << "\n========================================\n";
+    log << "POST-AUTOMATION IMAGE SEQUENCE\n";
+    log << "========================================\n";
+
+    if (!WaitForAndTapExternalTemplate(
+        deviceId,
+        "photon_marker.png",
+        "PHOTON marker",
+        log))
+    {
+        log << "POST-AUTOMATION STOPPED at PHOTON marker.\n";
+        return false;
+    }
+
+    const std::array<const char*, 6> targetFiles =
+    {
+        "target_1.png",
+        "target_2.png",
+        "target_3.png",
+        "target_4.png",
+        "target_5.png",
+        "target_6.png"
+    };
+
+    for (size_t i = 0; i < targetFiles.size(); ++i)
+    {
+        const std::string displayName =
+            "TARGET " + std::to_string(i + 1);
+
+        if (!WaitForAndTapExternalTemplate(
+            deviceId,
+            targetFiles[i],
+            displayName,
+            log))
+        {
+            log << "POST-AUTOMATION STOPPED at "
+                << displayName << ".\n";
+            return false;
+        }
+    }
+
+    log << "POST-AUTOMATION IMAGE SEQUENCE COMPLETED.\n";
+    return true;
+}
+
+// ============================================================
 // RANDOM ROLEPLAY NAMES
 // ============================================================
 
@@ -3006,6 +3137,9 @@ AutomationResult RunPhotonAutomation(
         << freshLoginDiagnostic << "\n";
 
     bool afterDetected = false;
+    bool firstNameFieldConfirmed = false;
+    POINT firstNameCenter{};
+    std::string firstNameFieldDiagnostic;
 
     for (int attempt = 1; attempt <= 2; ++attempt)
     {
@@ -3028,6 +3162,30 @@ AutomationResult RunPhotonAutomation(
 
         log << tapDiagnostic << "\n";
 
+        // Check the actual next-stage field first. On the observed game
+        // screen this appears immediately after login, so this avoids wasting
+        // the full legacy-template timeout on a screen that has already changed.
+        firstNameFieldConfirmed = WaitForInputField(
+            device.id,
+            "enter_name",
+            firstNameCenter,
+            firstNameFieldDiagnostic,
+            5000
+        );
+
+        if (firstNameFieldConfirmed)
+        {
+            log << "LOGIN TRANSITION CONFIRMED BY NAME FIELD. "
+                << firstNameFieldDiagnostic << "\n";
+            result.loginConfirmed = true;
+            break;
+        }
+
+        log << "Name field not confirmed yet: "
+            << firstNameFieldDiagnostic << "\n";
+
+        // Keep compatibility with versions where an intermediate screen is
+        // displayed before the name-entry form.
         double afterConfidence = 0.0;
         std::string afterDiagnostic;
 
@@ -3052,14 +3210,15 @@ AutomationResult RunPhotonAutomation(
             POINT retryCenter{};
             std::string retryDiagnostic;
 
-            bool stillVisible = DetectPhotonReady(
+            const bool stillVisible = DetectPhotonReady(
                 device.id,
                 retryConfidence,
                 retryCenter,
                 retryDiagnostic
             );
 
-            log << retryDiagnostic << "\n";
+            log << "Login-button state after failed transition check: "
+                << retryDiagnostic << "\n";
 
             if (stillVisible)
             {
@@ -3068,6 +3227,9 @@ AutomationResult RunPhotonAutomation(
             }
             else
             {
+                // The login button disappeared, so do not click its old
+                // coordinates again. The screen changed, but the expected
+                // name field was not confirmed.
                 break;
             }
         }
@@ -3075,20 +3237,24 @@ AutomationResult RunPhotonAutomation(
 
     if (!result.loginConfirmed)
     {
-        log << "FAILED: Login transition not confirmed.\n";
+        log << "FAILED: Login transition not confirmed. "
+            << "Neither the post-login template nor enter_name.png was confirmed.\n";
         return result;
     }
 
     // --------------------------------------------------------
-// STEP 3: CLEAR NAME AND IMMEDIATELY INPUT NEW NAME
-// --------------------------------------------------------
+    // STEP 3: CLEAR NAME AND IMMEDIATELY INPUT NEW NAME
+    // --------------------------------------------------------
 
     log << "\n[3] FIND FIRST-NAME FIELD FROM enter_name.png\n";
 
     std::string nameDiagnostic;
-    POINT firstNameCenter{};
-
-    if (!WaitForInputField(
+    if (firstNameFieldConfirmed)
+    {
+        nameDiagnostic = firstNameFieldDiagnostic;
+        log << "Using the name field already confirmed after login.\n";
+    }
+    else if (!WaitForInputField(
         device.id,
         "enter_name",
         firstNameCenter,
@@ -3569,6 +3735,47 @@ void StartPhotonAutomation()
                     << "DEVICE RESULT: "
                     << (results[i].success ? "SUCCESS" : "FAILED")
                     << "\n";
+            }
+
+            // Run the optional visual sequence only after all primary
+            // device automations have finished successfully.
+            for (size_t i = 0; i < selectedDevices.size(); ++i)
+            {
+                if (!results[i].success)
+                    continue;
+
+                LivePhotonLogBuffer postLogBuffer;
+                std::ostream postLog(&postLogBuffer);
+
+                postLog
+                    << "\n========================================\n"
+                    << "POST-AUTOMATION DEVICE "
+                    << selectedDevices[i].id << "\n"
+                    << "========================================\n";
+
+                try
+                {
+                    if (!RunPostAutomationImageSequence(
+                        selectedDevices[i].id,
+                        postLog))
+                    {
+                        postLog << "Post-automation sequence did not complete.\n";
+                    }
+                }
+                catch (const cv::Exception& e)
+                {
+                    postLog << "Post-automation OpenCV exception: "
+                            << e.what() << "\n";
+                }
+                catch (const std::exception& e)
+                {
+                    postLog << "Post-automation exception: "
+                            << e.what() << "\n";
+                }
+                catch (...)
+                {
+                    postLog << "Unknown post-automation exception.\n";
+                }
             }
 
             int successCount = 0;
