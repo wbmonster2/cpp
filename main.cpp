@@ -3162,7 +3162,30 @@ AutomationResult RunPhotonAutomation(
 
         log << tapDiagnostic << "\n";
 
-        // First try the legacy post-login template.
+        // Check the actual next-stage field first. On the observed game
+        // screen this appears immediately after login, so this avoids wasting
+        // the full legacy-template timeout on a screen that has already changed.
+        firstNameFieldConfirmed = WaitForInputField(
+            device.id,
+            "enter_name",
+            firstNameCenter,
+            firstNameFieldDiagnostic,
+            5000
+        );
+
+        if (firstNameFieldConfirmed)
+        {
+            log << "LOGIN TRANSITION CONFIRMED BY NAME FIELD. "
+                << firstNameFieldDiagnostic << "\n";
+            result.loginConfirmed = true;
+            break;
+        }
+
+        log << "Name field not confirmed yet: "
+            << firstNameFieldDiagnostic << "\n";
+
+        // Keep compatibility with versions where an intermediate screen is
+        // displayed before the name-entry form.
         double afterConfidence = 0.0;
         std::string afterDiagnostic;
 
@@ -3180,30 +3203,6 @@ AutomationResult RunPhotonAutomation(
             result.loginConfirmed = true;
             break;
         }
-
-        // The actual game screen may already show the name fields even when
-        // photon_after_login.png does not match. Confirm the real next-stage
-        // control directly, using the existing multi-frame field detector.
-        log << "Legacy post-login image not confirmed; checking enter_name.png.\n";
-
-        firstNameFieldConfirmed = WaitForInputField(
-            device.id,
-            "enter_name",
-            firstNameCenter,
-            firstNameFieldDiagnostic,
-            12000
-        );
-
-        if (firstNameFieldConfirmed)
-        {
-            log << "LOGIN TRANSITION CONFIRMED BY NAME FIELD. "
-                << firstNameFieldDiagnostic << "\n";
-            result.loginConfirmed = true;
-            break;
-        }
-
-        log << "Name-field confirmation not yet available: "
-            << firstNameFieldDiagnostic << "\n";
 
         if (attempt == 1)
         {
