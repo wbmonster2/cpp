@@ -3713,10 +3713,10 @@ void StartPhotonAutomation()
                 std::ostream postLog(&postLogBuffer);
 
                 postLog
-                    << "\\n========================================\\n"
+                    << "\n========================================\n"
                     << "POST-AUTOMATION DEVICE "
-                    << selectedDevices[i].id << "\\n"
-                    << "========================================\\n";
+                    << selectedDevices[i].id << "\n"
+                    << "========================================\n";
 
                 try
                 {
@@ -3724,22 +3724,22 @@ void StartPhotonAutomation()
                         selectedDevices[i].id,
                         postLog))
                     {
-                        postLog << "Post-automation sequence did not complete.\\n";
+                        postLog << "Post-automation sequence did not complete.\n";
                     }
                 }
                 catch (const cv::Exception& e)
                 {
                     postLog << "Post-automation OpenCV exception: "
-                            << e.what() << "\\n";
+                            << e.what() << "\n";
                 }
                 catch (const std::exception& e)
                 {
                     postLog << "Post-automation exception: "
-                            << e.what() << "\\n";
+                            << e.what() << "\n";
                 }
                 catch (...)
                 {
-                    postLog << "Unknown post-automation exception.\\n";
+                    postLog << "Unknown post-automation exception.\n";
                 }
             }
 
