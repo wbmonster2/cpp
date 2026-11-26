@@ -1577,7 +1577,8 @@ bool AreAllStageTemplatesLoaded()
 bool DecodeImage(
     const std::vector<unsigned char>& data,
     cv::Mat& image,
-    std::string& diagnostic)
+    std::string& diagnostic,
+    cv::Size* originalSize)
 {
     image.release();
 
@@ -1596,6 +1597,9 @@ bool DecodeImage(
             diagnostic = "Cannot decode screenshot.";
             return false;
         }
+
+        if (originalSize)
+            *originalSize = image.size();
 
         if (image.cols != SCREEN_WIDTH ||
             image.rows != SCREEN_HEIGHT)
@@ -1628,7 +1632,8 @@ bool CaptureADBScreenshot(
     const std::string& deviceId,
     cv::Mat& screen,
     std::string& diagnostic,
-    ULONGLONG deadline)
+    ULONGLONG deadline,
+    cv::Size* originalSize = nullptr)
 {
     constexpr DWORD maxCaptureMs = 4000;
     const DWORD timeout = std::min(maxCaptureMs, RemainingTime(deadline));
@@ -1641,7 +1646,7 @@ bool CaptureADBScreenshot(
     std::vector<unsigned char> imageData;
     const std::wstring arguments = L"-s " + DeviceArgument(deviceId) + L" exec-out screencap -p";
     return RunProcess(ADBExecutable(), arguments, imageData, diagnostic, timeout, false, true) &&
-        DecodeImage(imageData, screen, diagnostic);
+        DecodeImage(imageData, screen, diagnostic, originalSize);
 }
 
 // ============================================================
@@ -2086,7 +2091,8 @@ bool DetectPhotonMarkerTemplate(
     double& confidence,
     POINT& matchCenter,
     std::string& diagnostic,
-    ULONGLONG deadline)
+    ULONGLONG deadline,
+    cv::Size& originalSize)
 {
     confidence = 0.0;
     matchCenter = { 0, 0 };
@@ -2098,7 +2104,7 @@ bool DetectPhotonMarkerTemplate(
     }
 
     cv::Mat screenshot;
-    if (!CaptureADBScreenshot(deviceId, screenshot, diagnostic, deadline))
+    if (!CaptureADBScreenshot(deviceId, screenshot, diagnostic, deadline, &originalSize))
         return false;
 
     try
@@ -2256,6 +2262,44 @@ bool LoadExternalTemplate(
     return false;
 }
 
+bool TapPhotonMarker(
+    const std::string& deviceId,
+    POINT center,
+    cv::Size originalSize,
+    std::string& diagnostic)
+{
+    if (originalSize.width <= 0 || originalSize.height <= 0 ||
+        center.x < 0 || center.x >= SCREEN_WIDTH || center.y < 0 || center.y >= SCREEN_HEIGHT)
+    {
+        diagnostic = "Invalid PHOTON marker touch coordinates.";
+        return false;
+    }
+
+    const auto x = (2LL * center.x + 1) * originalSize.width / (2 * SCREEN_WIDTH);
+    const auto y = (2LL * center.y + 1) * originalSize.height / (2 * SCREEN_HEIGHT);
+    const std::wstring arguments = L"-s " + DeviceArgument(deviceId) +
+        L" shell input touchscreen tap " + std::to_wstring(x) + L" " + std::to_wstring(y);
+
+    std::vector<unsigned char> output;
+    const bool succeeded = RunProcess(ADBExecutable(), arguments, output, diagnostic, 5000, true, true);
+    const std::string response = Trim(std::string(output.begin(), output.end()));
+    // Android's input command may print an error even when the shell returns zero.
+    if (!succeeded || !response.empty())
+    {
+        if (!response.empty())
+        {
+            if (!diagnostic.empty())
+                diagnostic += " ";
+            diagnostic += response;
+        }
+        return false;
+    }
+
+    diagnostic = "ADB touchscreen tap sent for PHOTON marker at (" + std::to_string(x) +
+        ", " + std::to_string(y) + ").";
+    return true;
+}
+
 bool RunPostAutomationImageSequence(
     const std::string& deviceId,
     std::ostream& log)
@@ -2280,11 +2324,12 @@ bool RunPostAutomationImageSequence(
         POINT center{};
         std::string diagnostic;
         const bool marker = i == 0;
+        cv::Size originalSize;
         if (!WaitForTemplate(names[i], STAGE_TIMEOUT_MS, 2,
             [&](double& score, POINT& point, std::string& last, ULONGLONG deadline)
             {
                 if (marker)
-                    return DetectPhotonMarkerTemplate(deviceId, templates[i], score, point, last, deadline);
+                    return DetectPhotonMarkerTemplate(deviceId, templates[i], score, point, last, deadline, originalSize);
                 return DetectPhotonTemplate(deviceId, templates[i], score, point, last, deadline);
             },
             confidence, center, diagnostic))
@@ -2294,7 +2339,10 @@ bool RunPostAutomationImageSequence(
         }
 
         log << diagnostic << "\n";
-        if (!TapADB(deviceId, center.x, center.y, diagnostic))
+        const bool clicked = marker
+            ? TapPhotonMarker(deviceId, center, originalSize, diagnostic)
+            : TapADB(deviceId, center.x, center.y, diagnostic);
+        if (!clicked)
         {
             log << "Click failed. " << diagnostic << "\n";
             return false;
