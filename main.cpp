@@ -2333,8 +2333,8 @@ bool RunPostAutomationImageSequence(
     }
     log << diagnostic << "\n";
     const POINT tappedCenter = center;
-    const bool tapSent = TapPhotonMarker(deviceId, center, originalSize, diagnostic);
-    log << (tapSent ? "" : "ADB marker tap failed. ") << diagnostic << "\n";
+    const bool pressed = ClickEmulator(deviceId, center.x, center.y, 160, false, diagnostic);
+    log << (pressed ? "Marker mouse press (160 ms). " : "Marker mouse press failed. ") << diagnostic << "\n";
 
     for (size_t i = 1; i < names.size(); ++i)
     {
@@ -2363,9 +2363,9 @@ bool RunPostAutomationImageSequence(
                     found = WaitForTemplate(names[i], 4500, 2, detectTarget, score, center, diagnostic);
                 else if (diagnostic.rfind("Match: ", 0) == 0 && !IsAutomationCancelled())
                 {
-                    log << "Marker still visible. Trying a Windows mouse press (160 ms).\n";
-                    const bool pressed = ClickEmulator(deviceId, markerCenter.x, markerCenter.y, 160, false, diagnostic);
-                    log << (pressed ? "" : "Marker mouse press failed. ") << diagnostic << "\n";
+                    log << "Marker still visible. Trying an ADB touchscreen tap.\n";
+                    const bool tapSent = TapPhotonMarker(deviceId, markerCenter, originalSize, diagnostic);
+                    log << (tapSent ? "" : "ADB marker tap failed. ") << diagnostic << "\n";
                 }
             }
             else
