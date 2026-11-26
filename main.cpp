@@ -2679,19 +2679,75 @@ bool WaitForAndTapExternalTemplate(
 {
     cv::Mat image;
     std::string loadDiagnostic;
+    std::string loadedFilename = filename;
 
-    if (!LoadPhotonTemplate(
-        GetTemplatePath(Utf8ToWide(filename)),
-        image,
-        loadDiagnostic))
+    // Accept PNG, JPG and JPEG files. Try the requested extension first,
+    // then the common alternatives so a marker saved as .jpg is not missed.
+    std::vector<std::string> candidateFiles = { filename };
+
+    const size_t dot = filename.find_last_of('.');
+    const std::string stem =
+        (dot == std::string::npos) ? filename : filename.substr(0, dot);
+
+    const std::string extension =
+        (dot == std::string::npos) ? "" : filename.substr(dot);
+
+    if (_stricmp(extension.c_str(), ".png") == 0)
     {
-        log << "POST-AUTOMATION: cannot load "
-            << filename << ": " << loadDiagnostic << "\n";
+        candidateFiles.push_back(stem + ".jpg");
+        candidateFiles.push_back(stem + ".jpeg");
+    }
+    else if (_stricmp(extension.c_str(), ".jpg") == 0)
+    {
+        candidateFiles.push_back(stem + ".png");
+        candidateFiles.push_back(stem + ".jpeg");
+    }
+    else if (_stricmp(extension.c_str(), ".jpeg") == 0)
+    {
+        candidateFiles.push_back(stem + ".png");
+        candidateFiles.push_back(stem + ".jpg");
+    }
+    else
+    {
+        candidateFiles.push_back(stem + ".png");
+        candidateFiles.push_back(stem + ".jpg");
+        candidateFiles.push_back(stem + ".jpeg");
+    }
+
+    bool templateLoaded = false;
+
+    for (const std::string& candidate : candidateFiles)
+    {
+        std::string candidateDiagnostic;
+
+        if (LoadPhotonTemplate(
+            GetTemplatePath(Utf8ToWide(candidate)),
+            image,
+            candidateDiagnostic))
+        {
+            loadedFilename = candidate;
+            loadDiagnostic = candidateDiagnostic;
+            templateLoaded = true;
+            break;
+        }
+
+        loadDiagnostic = candidateDiagnostic;
+    }
+
+    if (!templateLoaded)
+    {
+        log << "POST-AUTOMATION: cannot load template "
+            << filename
+            << " (also tried JPG/JPEG alternatives): "
+            << loadDiagnostic << "\n";
         return false;
     }
 
+    log << "LOADED TEMPLATE: " << loadedFilename
+        << " | " << loadDiagnostic << "\n";
+
     log << "WAITING FOR " << displayName
-        << " [" << filename << "]\n";
+        << " [" << loadedFilename << "]\n";
 
     int consecutiveMatches = 0;
 
