@@ -3137,6 +3137,9 @@ AutomationResult RunPhotonAutomation(
         << freshLoginDiagnostic << "\n";
 
     bool afterDetected = false;
+    bool firstNameFieldConfirmed = false;
+    POINT firstNameCenter{};
+    std::string firstNameFieldDiagnostic;
 
     for (int attempt = 1; attempt <= 2; ++attempt)
     {
@@ -3159,6 +3162,7 @@ AutomationResult RunPhotonAutomation(
 
         log << tapDiagnostic << "\n";
 
+        // First try the legacy post-login template.
         double afterConfidence = 0.0;
         std::string afterDiagnostic;
 
@@ -3177,20 +3181,45 @@ AutomationResult RunPhotonAutomation(
             break;
         }
 
+        // The actual game screen may already show the name fields even when
+        // photon_after_login.png does not match. Confirm the real next-stage
+        // control directly, using the existing multi-frame field detector.
+        log << "Legacy post-login image not confirmed; checking enter_name.png.\n";
+
+        firstNameFieldConfirmed = WaitForInputField(
+            device.id,
+            "enter_name",
+            firstNameCenter,
+            firstNameFieldDiagnostic,
+            12000
+        );
+
+        if (firstNameFieldConfirmed)
+        {
+            log << "LOGIN TRANSITION CONFIRMED BY NAME FIELD. "
+                << firstNameFieldDiagnostic << "\n";
+            result.loginConfirmed = true;
+            break;
+        }
+
+        log << "Name-field confirmation not yet available: "
+            << firstNameFieldDiagnostic << "\n";
+
         if (attempt == 1)
         {
             double retryConfidence = 0.0;
             POINT retryCenter{};
             std::string retryDiagnostic;
 
-            bool stillVisible = DetectPhotonReady(
+            const bool stillVisible = DetectPhotonReady(
                 device.id,
                 retryConfidence,
                 retryCenter,
                 retryDiagnostic
             );
 
-            log << retryDiagnostic << "\n";
+            log << "Login-button state after failed transition check: "
+                << retryDiagnostic << "\n";
 
             if (stillVisible)
             {
@@ -3199,6 +3228,9 @@ AutomationResult RunPhotonAutomation(
             }
             else
             {
+                // The login button disappeared, so do not click its old
+                // coordinates again. The screen changed, but the expected
+                // name field was not confirmed.
                 break;
             }
         }
@@ -3206,20 +3238,24 @@ AutomationResult RunPhotonAutomation(
 
     if (!result.loginConfirmed)
     {
-        log << "FAILED: Login transition not confirmed.\n";
+        log << "FAILED: Login transition not confirmed. "
+            << "Neither the post-login template nor enter_name.png was confirmed.\n";
         return result;
     }
 
     // --------------------------------------------------------
-// STEP 3: CLEAR NAME AND IMMEDIATELY INPUT NEW NAME
-// --------------------------------------------------------
+    // STEP 3: CLEAR NAME AND IMMEDIATELY INPUT NEW NAME
+    // --------------------------------------------------------
 
     log << "\n[3] FIND FIRST-NAME FIELD FROM enter_name.png\n";
 
     std::string nameDiagnostic;
-    POINT firstNameCenter{};
-
-    if (!WaitForInputField(
+    if (firstNameFieldConfirmed)
+    {
+        nameDiagnostic = firstNameFieldDiagnostic;
+        log << "Using the name field already confirmed after login.\n";
+    }
+    else if (!WaitForInputField(
         device.id,
         "enter_name",
         firstNameCenter,
